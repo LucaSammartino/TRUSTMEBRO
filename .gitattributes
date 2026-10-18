@@ -1,0 +1,4 @@
+# Windows scripts must keep Windows line endings even when downloaded as a zip
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+* text=auto
