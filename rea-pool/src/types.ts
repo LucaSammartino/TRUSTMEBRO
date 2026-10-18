@@ -51,6 +51,8 @@ export interface Task {
   proposalId?: string;
   /** For analyze tasks: which attempt this is (starts at 1). */
   attempts?: number;
+  /** For analyze tasks: addresses of the functions this one calls, when known. Missing means not discovered yet. */
+  callees?: string[];
 }
 
 /**
@@ -78,6 +80,8 @@ export interface Note {
   reason?: string;
   /** How many independent checkers agreed. */
   agrees?: number;
+  /** The trusted callee names the pool had when this was written, as "address=name". Lets a later rename be noticed. */
+  basedOn?: string[];
 }
 
 export type Verdict = "agree" | "disagree" | "unsure";

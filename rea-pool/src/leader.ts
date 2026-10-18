@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Leader tool. One command does the setup:  leader start <software-file>
 import { randomBytes } from "node:crypto";
-import { runCommand } from "./exec.ts";
+import { runCommand, runCommandAsync } from "./exec.ts";
+import { addCallees, calleesFromReaFunction, graphStats, normalizeAddress } from "./graph.ts";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { networkInterfaces } from "node:os";
@@ -59,6 +60,9 @@ function usage(): never {
                                       List what has been sent in
   export <out.json> [--best] [--include-unverified]
                                       Save trusted results (--best: one winner per function and kind)
+  graph <software-file> [--parallel 4] [--limit N]
+                                      Read which function calls which (slow: ~40s per function, run in
+                                      parallel). Safe to stop with Ctrl+C and run again to continue.
   revoke <person>                     Cancel someone's access
   approve <note-id> | reject <note-id>
                                       Optional overrides. You never need these.
@@ -146,6 +150,109 @@ function printJoinLine(state: State, port: string, host: string): void {
   } else if (where.length > 1) {
     console.log(`Other addresses this computer has: ${where.slice(1).join(", ")}`);
   }
+}
+
+/** Short read-modify-write of state.json: copy known callees from the graph file into tasks that lack them. */
+function mergeGraphIntoState(statePath: string, graph: Record<string, string[]>): number {
+  const state = loadState(statePath);
+  let merged = 0;
+  for (const task of state.tasks) {
+    if ((task.kind ?? "analyze") !== "analyze" || task.callees) continue;
+    const callees = graph[normalizeAddress(task.address) ?? ""];
+    if (!callees) continue;
+    addCallees(task, callees);
+    merged++;
+  }
+  if (merged > 0) saveState(statePath, state);
+  return merged;
+}
+
+async function buildGraph(file: string, dataDir: string, statePath: string, flags: Record<string, string>): Promise<void> {
+  const num = (v: string | undefined, fallback: number) => (v && v !== "true" && Number.isFinite(Number(v)) ? Math.floor(Number(v)) : fallback);
+  const parallel = Math.min(16, Math.max(1, num(flags.parallel, 4)));
+  const limit = num(flags.limit, Infinity);
+  const graphPath = join(dataDir, "graph.json");
+  const graph: Record<string, string[]> = existsSync(graphPath) ? readJson<Record<string, string[]>>(graphPath) : {};
+
+  const first = loadState(statePath);
+  const isCandidate = (t: Task) => (t.kind ?? "analyze") === "analyze" && t.callees === undefined;
+  const fromFile = first.tasks.filter((t) => isCandidate(t) && graph[normalizeAddress(t.address) ?? ""]).length;
+  if (fromFile > 0) {
+    mergeGraphIntoState(statePath, graph);
+    console.log(`Applied ${fromFile} functions saved by an earlier run.`);
+  }
+  const queue = loadState(statePath)
+    .tasks.filter(isCandidate)
+    .map((t) => ({ id: t.id, address: t.address }))
+    .slice(0, limit);
+  if (queue.length === 0) {
+    console.log("Nothing to do: every function already has its callees.");
+    console.log(formatGraphStats(loadState(statePath)));
+    return;
+  }
+  console.log(`Reading callees of ${queue.length} functions, ${parallel} at a time. Each call takes about 40 seconds. Ctrl+C is safe; run the same command again to continue.`);
+
+  let done = 0;
+  let failed = 0;
+  let sinceMerge = 0;
+  let lastPrint = 0;
+  const total = queue.length;
+  const progress = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastPrint < 5000) return;
+    lastPrint = now;
+    console.log(`Graph: ${done}/${total} (${failed} failed) ...`);
+  };
+  const merge = () => {
+    sinceMerge = 0;
+    try {
+      mergeGraphIntoState(statePath, graph);
+    } catch (err) {
+      console.error(`Could not update the project state: ${err instanceof Error ? err.message : err}`);
+    }
+  };
+
+  let stopping = false;
+  process.on("SIGINT", () => {
+    if (stopping) process.exit(130);
+    stopping = true;
+    console.log("\nStopping; saving what was found...");
+    merge();
+    console.log(formatGraphStats(loadState(statePath)));
+    process.exit(130);
+  });
+
+  let next = 0;
+  const worker = async () => {
+    while (!stopping) {
+      const item = queue[next++];
+      if (!item) return;
+      try {
+        const run = await runCommandAsync("rea", ["function", file, item.address, "--provider", "ghidra", "--json"], { timeout: 10 * 60_000, maxBuffer: 256 * 1024 * 1024 });
+        if (run.error || run.status !== 0) throw new Error(run.error?.message ?? (run.stderr.trim().split("\n")[0] || `exit ${run.status}`));
+        const parsed = JSON.parse(run.stdout) as { normalized_result?: unknown };
+        if (!parsed.normalized_result) throw new Error("no normalized_result in output");
+        graph[normalizeAddress(item.address) ?? item.address] = calleesFromReaFunction(parsed.normalized_result, item.address);
+        writeJsonAtomic(graphPath, graph);
+        done++;
+        if (++sinceMerge >= 25) merge();
+      } catch (err) {
+        failed++;
+        console.error(`  ${item.address}: ${(err instanceof Error ? err.message : String(err)).slice(0, 160)}`);
+      }
+      progress();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(parallel, queue.length) }, worker));
+  merge();
+  progress(true);
+  console.log(formatGraphStats(loadState(statePath)));
+  if (failed > 0) console.log(`${failed} functions failed; run the command again to retry them.`);
+}
+
+function formatGraphStats(state: State): string {
+  const g = graphStats(state);
+  return `Call graph: ${g.known} of ${g.known + g.unknown} functions known, ${g.edges} edges, ${g.ready} ready`;
 }
 
 async function main() {
@@ -252,8 +359,19 @@ async function main() {
       const count = (s: string) => state.proposals.filter((p) => p.status === s).length;
       console.log(`${state.project.name}`);
       console.log(`  Functions: ${analysis.length}; done ${analysis.filter((t) => t.state === "done").length}, waiting ${analysis.filter((t) => t.state === "open").length}, in progress ${analysis.filter((t) => t.state === "claimed" && Date.parse(t.leaseUntil ?? "") > now).length}`);
+      console.log(`  ${formatGraphStats(state)}`);
       console.log(`  Results: ${count("trusted")} trusted, ${count("pending")} waiting for a check, ${count("hint")} hints, ${count("rejected")} rejected`);
       console.log(`  People: ${state.contributors.filter((c) => !c.revoked).map((c) => c.name).join(", ") || "nobody yet"}`);
+      break;
+    }
+    case "graph": {
+      needState();
+      const file = rest[0];
+      if (!file || !existsSync(file)) {
+        console.error("Give the path to your copy of the software: graph <software-file> [--parallel 4]");
+        process.exit(1);
+      }
+      await buildGraph(file, dataDir, statePath, flags);
       break;
     }
     case "notes": {

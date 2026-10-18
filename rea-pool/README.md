@@ -89,6 +89,15 @@ Safety rules run automatically on every note: same file and tool versions requir
 
 The model name a note carries is only informational (it cannot be proven), so it never affects trust.
 
+## Working bottom-up (call graph)
+
+Functions are easier to name once the functions they call already have trusted names. The pool uses this in two ways:
+
+- Whoever analyzes a function also reports which functions it calls, so the pool learns the call graph as it goes.
+- Functions whose callees are already named are handed out first, and those trusted names are shown to the AI as context. Names that are still being checked are never shown.
+
+The leader can also read the whole graph up front with `leader graph <software file> --parallel 4`. Each function takes about 40 seconds because Ghidra starts fresh every time, so run it in parallel; it is safe to stop with Ctrl+C and run again to continue. `leader status` shows how much of the graph is known.
+
 ## What it does not do
 
 - It cannot prove a result is *correct*, only that it passed these checks. Treat results as strong suggestions.
@@ -99,6 +108,6 @@ The model name a note carries is only informational (it cannot be proven), so it
 
 ## Files
 
-`src/leader.ts` (leader tool), `src/cli.ts` (contributor tool), `src/server.ts` (the rules of the pool and the web server), `src/trust.ts` (confidence and voting rules), `src/agent.ts` (talks to rea and the AI), `src/rules.ts` (note safety rules), `src/check.ts` (setup checks), `test/` (automated tests), `examples/` (benchmark helpers).
+`src/leader.ts` (leader tool), `src/cli.ts` (contributor tool), `src/server.ts` (the rules of the pool and the web server), `src/trust.ts` (confidence and voting rules), `src/agent.ts` (talks to rea and the AI), `src/graph.ts` (call graph: which function calls which), `src/rules.ts` (note safety rules), `src/check.ts` (setup checks), `test/` (automated tests), `examples/` (benchmark helpers).
 
 Run the tests with `npm test`.

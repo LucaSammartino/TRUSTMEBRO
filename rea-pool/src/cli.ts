@@ -95,6 +95,7 @@ function describe(status: NoteStatus, reason?: string): string {
 interface ClaimReply {
   task: Task | null;
   proposal?: { notes: { kind: string; value: string }[] };
+  callees?: { address: string; name: string }[];
   finished: boolean;
 }
 
@@ -136,12 +137,12 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
     process.stdout.write(`${isReview ? "Checking" : "Analyzing"} ${task.label} ... `);
     try {
       if (isReview) {
-        const verdict = review(ctx, task.address, claim.proposal?.notes ?? []);
+        const verdict = review(ctx, task.address, claim.proposal?.notes ?? [], claim.callees ?? []);
         await api(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, verdict });
         console.log(`you said: ${verdict}`);
       } else {
-        const notes = analyze(ctx, task.address);
-        const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, notes });
+        const { notes, callees } = analyze(ctx, task.address, claim.callees ?? []);
+        const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, notes, callees });
         console.log(describe(results.find((r) => r.status !== "rejected")?.status ?? "rejected", results.find((r) => r.status === "rejected")?.reason));
       }
       failures = 0;

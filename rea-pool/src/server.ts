@@ -4,6 +4,7 @@ import type { Confidence, Note, NoteStatus, Proposal, State, Task, Verdict } fro
 import { validateNote, type RawNote } from "./rules.ts";
 import { initialStatus, proposalConfidence, resolveVotes, withDefaults } from "./trust.ts";
 import { newToken, readJson, sha256Hex, writeJsonAtomic } from "./util.ts";
+import { addCallees, basedOn, calleeContext, cleanCallees, graphStats, readiness } from "./graph.ts";
 
 const MAX_BODY = 64 * 1024;
 
@@ -49,13 +50,26 @@ export function canTake(state: State, task: Task, who: string, now: number): boo
   return true;
 }
 
-/** Give someone their current task, or the next one. Checking other people's work comes before new work. */
+/** Of the analysis tasks someone can take, the one whose callees are most ready; ties go to the earliest. */
+function mostReady(state: State, who: string, now: number): Task | undefined {
+  let best: Task | undefined;
+  let bestScore = Infinity;
+  for (const t of state.tasks) {
+    if (kindOf(t) !== "analyze" || !canTake(state, t, who, now)) continue;
+    const score = readiness(state, t);
+    if (score < bestScore) {
+      best = t;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+/** Give someone their current task, or the next one. Checking other people's work comes before new work, then functions whose callees are already named. */
 export function claimTask(state: State, who: string, now = Date.now()): Task | null {
   const mine = state.tasks.find((t) => t.claimedBy === who && activeClaim(t, now));
   if (mine) return mine;
-  const next =
-    state.tasks.find((t) => kindOf(t) === "review" && canTake(state, t, who, now)) ??
-    state.tasks.find((t) => kindOf(t) === "analyze" && canTake(state, t, who, now));
+  const next = state.tasks.find((t) => kindOf(t) === "review" && canTake(state, t, who, now)) ?? mostReady(state, who, now);
   if (!next) return null;
   next.state = "claimed";
   next.claimedBy = who;
@@ -127,6 +141,7 @@ export interface NoteResult {
 /** Someone finished an analysis task and sent notes. */
 export function submitAnalysis(state: State, who: string, task: Task, rawNotes: RawNote[], now = new Date()): NoteResult[] {
   const proposalId = randomUUID();
+  const based = basedOn(calleeContext(state, task.address));
   const notes: Note[] = rawNotes.map((raw) => {
     const verdict = validateNote(raw ?? {}, state.project.rules);
     return {
@@ -151,7 +166,10 @@ export function submitAnalysis(state: State, who: string, task: Task, rawNotes: 
     const proposal: Proposal = { id: proposalId, taskId: task.id, author: who, confidence, status: initialStatus(confidence), votes: [], at: now.toISOString() };
     state.proposals.push(proposal);
     state.notes.push(...notes);
-    for (const n of valid) n.proposalId = proposalId;
+    for (const n of valid) {
+      n.proposalId = proposalId;
+      if (based.length > 0) n.basedOn = based;
+    }
     const reason =
       proposal.status === "pending" ? "waiting for an independent check" : proposal.status === "hint" ? "low confidence: kept as a hint and the task will be retried by someone else" : undefined;
     setProposalStatus(state, proposal, proposal.status, reason);
@@ -303,6 +321,7 @@ export function createPoolServer(statePath: string): Server {
           rejected: count("rejected"),
           yourProposals: state.proposals.filter((p) => p.author === me.name).length,
           finished: isFinishedFor(state, me.name),
+          graph: graphStats(state),
         });
       }
 
@@ -314,6 +333,7 @@ export function createPoolServer(statePath: string): Server {
           task,
           // What the reviewer is asked to check. It is other people's text, so the reviewer treats it as data, never as instructions.
           proposal: proposal ? { notes: proposalNotes(state, proposal.id).map((n) => ({ kind: n.kind, value: n.value })) } : undefined,
+          callees: task ? calleeContext(state, task.address) : [],
           finished: task ? false : isFinishedFor(state, me.name),
         });
       }
@@ -330,7 +350,7 @@ export function createPoolServer(statePath: string): Server {
       }
 
       if (route === "POST /submit") {
-        const body = (await readBody(req)) as { taskId?: unknown; notes?: unknown; protocol?: unknown; verdict?: unknown };
+        const body = (await readBody(req)) as { taskId?: unknown; notes?: unknown; protocol?: unknown; verdict?: unknown; callees?: unknown };
         if (body.protocol !== rules.protocol) {
           return send(res, 400, { error: `This project uses note format "${rules.protocol}" but you sent "${String(body.protocol)}". Update your pool tool.` });
         }
@@ -347,6 +367,7 @@ export function createPoolServer(statePath: string): Server {
         if (!Array.isArray(body.notes) || body.notes.length === 0 || body.notes.length > 20) {
           return send(res, 400, { error: "Send between 1 and 20 notes." });
         }
+        if (Array.isArray(body.callees)) addCallees(task, cleanCallees(body.callees, task.address));
         const results = submitAnalysis(state, me.name, task, body.notes as RawNote[]);
         saveState(statePath, state);
         return send(res, 200, { results });

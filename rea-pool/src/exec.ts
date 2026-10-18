@@ -1,4 +1,4 @@
-import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from "node:child_process";
 
 export const IS_WINDOWS = process.platform === "win32";
 
@@ -34,6 +34,68 @@ export function runCommand(program: string, args: string[], options: RunOptions 
     if (UNSAFE_ON_WINDOWS.test(part)) throw new Error("A path or value contains characters this tool cannot use. Move the file to a simpler folder.");
   }
   return spawnSync([program, ...args].map(windowsQuote).join(" "), { ...base, shell: true });
+}
+
+export interface AsyncResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+}
+
+/**
+ * Same as runCommand (same safety rules), but does not block: use it to run several programs at once.
+ * Never rejects; check `result.error`. Throws only for unusable characters on Windows (before starting).
+ */
+export function runCommandAsync(program: string, args: string[], options: RunOptions = {}): Promise<AsyncResult> {
+  const timeout = options.timeout ?? 120_000;
+  const maxBuffer = options.maxBuffer ?? 64 * 1024 * 1024;
+  let child: ChildProcess;
+  if (!IS_WINDOWS) {
+    child = spawn(program, args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
+  } else {
+    for (const part of [program, ...args]) {
+      if (UNSAFE_ON_WINDOWS.test(part)) throw new Error("A path or value contains characters this tool cannot use. Move the file to a simpler folder.");
+    }
+    child = spawn([program, ...args].map(windowsQuote).join(" "), { shell: true, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  }
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let error: Error | undefined;
+    let settled = false;
+    const kill = () => {
+      if (IS_WINDOWS && child.pid) spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+      else child.kill("SIGKILL");
+    };
+    const timer = setTimeout(() => {
+      error = new Error(`timed out after ${Math.round(timeout / 1000)}s`);
+      kill();
+    }, timeout);
+    const finish = (status: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status, stdout, stderr, error });
+    };
+    const collect = (which: "out" | "err") => (chunk: Buffer) => {
+      if (which === "out") stdout += chunk.toString("utf8");
+      else stderr += chunk.toString("utf8");
+      if (stdout.length + stderr.length > maxBuffer && !error) {
+        error = new Error("output too large");
+        kill();
+      }
+    };
+    child.stdout?.on("data", collect("out"));
+    child.stderr?.on("data", collect("err"));
+    child.on("error", (err) => {
+      error = error ?? err;
+      finish(null);
+    });
+    child.on("close", (code) => finish(code));
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(options.input);
+  });
 }
 
 /** Run a command line the user wrote themselves (such as their AI command). It is theirs, so a shell is fine. */
