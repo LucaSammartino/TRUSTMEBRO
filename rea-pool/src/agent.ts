@@ -1,7 +1,7 @@
 // The built-in worker. It does two jobs:
 //   analyze: ask rea (Ghidra) for the decompiled function, ask an AI to name and describe it
 //   review:  ask rea for the same code, ask an AI whether someone else's name and description are right
-import { spawnSync } from "node:child_process";
+import { runCommand, runUserCommand } from "./exec.ts";
 
 export interface AgentContext {
   targetPath: string;
@@ -13,21 +13,15 @@ export interface AgentContext {
 
 /** Find an AI on this computer. Right now only the Claude command line is auto-detected; others can be passed with --ai. */
 export function detectAi(model?: string): string | undefined {
-  const probe = spawnSync("claude --version", { shell: true, encoding: "utf8", timeout: 15000 });
-  if (probe.status !== 0) return undefined;
+  const probe = runCommand("claude", ["--version"], { timeout: 15000 });
+  if (probe.error || probe.status !== 0) return undefined;
   return `claude -p --tools "" --no-session-persistence${model ? ` --model ${model}` : ""}`;
 }
 
 export function decompile(targetPath: string, address: string): string {
   if (!/^0x[0-9a-fA-F]+$/.test(address)) throw new Error("Task address looks wrong");
-  if (/["&|<>^%]/.test(targetPath)) throw new Error("Your software file's path contains characters this tool cannot use. Move the file to a simpler folder.");
-  // One command string (not an argument list) so Windows runs rea.cmd without a Node warning; the path was checked above.
-  const run = spawnSync(`rea decompile "${targetPath}" ${address} --provider ghidra --json`, {
-    encoding: "utf8",
-    shell: true,
-    maxBuffer: 64 * 1024 * 1024,
-    timeout: 10 * 60_000,
-  });
+  const run = runCommand("rea", ["decompile", targetPath, address, "--provider", "ghidra", "--json"], { timeout: 10 * 60_000 });
+  if (run.error) throw new Error(`Could not start rea: ${run.error.message}`);
   if (run.status !== 0) throw new Error(`rea failed: ${(run.stderr ?? "").slice(0, 400)}`);
   const result = JSON.parse(run.stdout).normalized_result;
   const code = typeof result === "string" ? result : JSON.stringify(result);
@@ -35,7 +29,7 @@ export function decompile(targetPath: string, address: string): string {
 }
 
 export function askAi(aiCommand: string, prompt: string): string {
-  const ai = spawnSync(aiCommand, { input: prompt, encoding: "utf8", shell: true, timeout: 5 * 60_000 });
+  const ai = runUserCommand(aiCommand, { input: prompt, timeout: 5 * 60_000 });
   if (ai.status !== 0) {
     const why = `${ai.stderr ?? ""} ${ai.stdout ?? ""}`.trim().slice(0, 300);
     throw new Error(`Your AI command failed${why ? `: ${why}` : ""}`);

@@ -314,3 +314,24 @@ test("oversized requests are refused", async () => {
     assert.ok([0, 400, 413].includes(result.status), `got ${result.status}`);
   });
 });
+
+// ---- running programs the same safe way everywhere -----------------------------------------
+
+import { IS_WINDOWS, runCommand } from "../src/exec.ts";
+
+test("odd-looking text is passed to programs as plain text, never run as a command", () => {
+  const text = "name $(whoami) `id` ; echo pwned.txt";
+  const run = runCommand(process.execPath, ["-e", "process.stdout.write(process.argv[1])", text]);
+  assert.equal(run.stdout, text);
+});
+
+test("Windows refuses characters a shell would act on", { skip: !IS_WINDOWS && "only applies to Windows" }, () => {
+  for (const bad of ["a&b", "a|b", "a<b", "a>b", "a^b", "a%b", "a\"b"]) {
+    assert.throws(() => runCommand(process.execPath, ["-e", "1", bad]), /cannot use/, bad);
+  }
+});
+
+test("a missing program is reported, not thrown", () => {
+  const run = runCommand("definitely-not-a-real-program-xyz", ["--version"]);
+  assert.ok(run.error || run.status !== 0);
+});

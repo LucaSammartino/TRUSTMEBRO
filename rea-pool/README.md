@@ -4,12 +4,17 @@ Lets a group of people point their own AI at the **same piece of software** and 
 
 There is **one leader** (who sets it up once) and any number of **contributors** (who just run one command and leave it going). Nobody reviews anything by hand: the AIs check each other.
 
-> Status: version 0.2. The pool logic is tested (21 automated tests). rea + Ghidra analysis works on Windows programs. The step where it calls the Claude command line has **not been run end to end** (the login had expired during development), and it has not been tried between two real computers.
+> Status: version 0.2. Works on **Windows, Linux and macOS** (including Apple Silicon). Automated tests run on all three on every change, including a clean-room install and a real analysis, and confirm all three systems find the identical list of functions in the same program. **Not yet tested:** two real computers talking over a network, and the Claude command-line step end to end (its login had expired during development).
 
-## Easy install for friends (Windows)
+## Easy install for friends
 
-1. Get this folder (zip or copy) and put it anywhere.
-2. **Double-click `START-HERE.cmd`.**
+Get this folder (zip or copy) and put it anywhere, then:
+
+| System | Do this |
+|---|---|
+| **Windows** | Double-click `START-HERE.cmd` |
+| **macOS** | Double-click `START-HERE.command`. If macOS refuses (downloaded files lose their "runnable" mark), open Terminal, type `bash ` (with a space), drag `setup.sh` into the window and press Enter |
+| **Linux** | Open a terminal in this folder and run `bash setup.sh` |
 
 That is all. It checks each thing you need, **asks before installing anything that is missing**, and then walks you through joining. It needs about 3 GB of free disk space and an internet connection the first time.
 
@@ -17,26 +22,28 @@ What it checks and installs:
 
 | Thing | Why | How |
 |---|---|---|
-| Node.js 24+ | runs this tool | Windows' installer (winget) |
-| Java 21 (JDK) | Ghidra needs it; your other Java versions are untouched | winget |
-| Ghidra 12.1.4 (about 570 MB) | reads the software | downloaded from the official GitHub page, **verified against its published fingerprint**, unpacked into `C:\Users\<you>\rea-pool-tools` |
+| Node.js 24+ | runs this tool | Windows: winget. Linux/macOS: official download, fingerprint-checked, into `~/.rea-pool` |
+| Java 21 (JDK) | Ghidra needs it; your other Java versions are untouched | Windows: winget. Linux/macOS: Eclipse Temurin download, fingerprint-checked |
+| Ghidra 12.1.4 (about 570 MB) | reads the software | downloaded from the official GitHub page, **verified against its published fingerprint**, unpacked into your own folder |
+| Ghidra's decompiler program | part of reading the software | normally included; **Apple Silicon Macs** need it built from source inside the download (a few minutes; needs Apple's developer tools: `xcode-select --install`, and `brew install bison`). The script tells you if something is missing |
 | rea 6.7.0 | lets an AI read the software | npm |
-| An AI | does the thinking | **not installed for you**: install the Claude command line from <https://claude.com/download>, run `claude auth login` in a normal window once, then run START-HERE again |
+| An AI | does the thinking | **not installed for you**: install the Claude command line from <https://claude.com/download>, run `claude auth login` in a normal window once, then run the start file again |
 
-It also sets three settings for your Windows user (`JAVA_HOME`, `GHIDRA_INSTALL_DIR`, `REA_ANALYSIS_PROVIDER`). If something goes wrong it says exactly what, and running it again continues where it left off. When it asks, paste the "pool join" line your friend sent you and drag the software file into the window. Leave the window open and walk away; run START-HERE again any time to continue.
+On Linux/macOS nothing needs administrator rights: everything goes into `~/.rea-pool`, and the settings are saved in `~/.rea-pool/env.sh`, which the `./pool` and `./leader` commands load for you. On Windows it sets three settings for your user (`JAVA_HOME`, `GHIDRA_INSTALL_DIR`, `REA_ANALYSIS_PROVIDER`). If something goes wrong it says exactly what, and running it again continues where it left off. When it asks, paste the "pool join" line your friend sent you and drag the software file into the window. Leave the window open and walk away; run the start file again any time to continue.
 
-Everyone also needs their own copy of the software (the exact same file; it is checked by fingerprint). Currently only Windows programs (`.exe`/`.dll`, 64-bit) are supported, because that is what rea's Windows Ghidra mode supports.
+Everyone also needs their own copy of the software (the exact same file; it is checked by fingerprint). Tested with a Windows 64-bit program (`.dll`) analyzed on all three systems. rea supports other kinds of programs, but we have not tested them.
 
 Other AIs work too if you pass a command: `pool run --ai "<command that reads a prompt on stdin and prints an answer>"`.
 
-Tested so far: the check-and-report logic, the Ghidra unpacking, and the launcher. **Not tested on a clean computer**: the actual winget installs. If one fails, the script says where to download that piece by hand.
+Tested on clean machines (in GitHub's test computers): the Linux and macOS installer, and the Windows installer for Ghidra and rea. **Not tested on a clean Windows computer:** the winget installs of Node and Java. If one fails, the script says where to download that piece by hand.
 
 ## Leader: set it up (once)
 
-First double-click `SETUP-ONLY.cmd` (same checks and installs as above, without joining anything). Then, in a terminal in this folder:
+First run the setup (`SETUP-ONLY.cmd` on Windows; `bash setup.sh --mode setup-only` on Linux/macOS): same checks and installs as above, without joining anything. Then, in a terminal in this folder:
 
 ```
-leader.cmd start <your copy of the software> --name "My project"
+leader.cmd start <your copy of the software> --name "My project"      (Windows)
+./leader start <your copy of the software> --name "My project"        (Linux/macOS)
 ```
 
 That one command fingerprints the software, records the tool versions **you** have installed as the requirements, asks rea for every function (one task each), and starts the server. It then prints a line to send to friends:
@@ -52,16 +59,16 @@ The same code works for everyone, so you do not create invites one by one. Run `
 Friends' tools connect to **your** computer over the internet (ordinary web requests). Your computer must be reachable, and your computer must stay on while they work.
 
 1. Easiest and safest: both of you install [Tailscale](https://tailscale.com) (free), sign in, and share your computer with your friend. Your Tailscale address looks like `100.x.y.z`.
-2. Start with `leader.cmd start <file> --host 0.0.0.0` and give your friend `http://100.x.y.z:8787` as the address.
+2. Start with `leader.cmd start <file> --host 0.0.0.0` (Windows) or `./leader start <file> --host 0.0.0.0` (Linux/macOS) and give your friend `http://100.x.y.z:8787` as the address.
 3. Do **not** put this on the open internet as it is. Traffic is not encrypted, and anyone with the join code can join. Use `new-code` to replace the code, `revoke <name>` to remove someone.
 
 ## Contributor: join and run
 
-Normally START-HERE.cmd does this for you. By hand:
+Normally the start file does this for you. By hand (use `pool.cmd` on Windows, `./pool` on Linux/macOS):
 
 ```
-pool.cmd join <address> <join-code> --target <your copy of the software>
-pool.cmd run
+pool join <address> <join-code> --target <your copy of the software>
+pool run
 ```
 
 `join` also checks your setup. `run` then takes a task, analyzes it with rea and your AI, sends the notes, and repeats until nothing is left. Stop any time with Ctrl+C. Your current task goes back to the pool.

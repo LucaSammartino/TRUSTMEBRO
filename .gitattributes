@@ -1,4 +1,9 @@
-# Windows scripts must keep Windows line endings even when downloaded as a zip
+# Windows scripts must keep Windows line endings, Unix scripts must keep Unix ones, even when downloaded as a zip
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+*.sh text eol=lf
+*.command text eol=lf
+rea-pool/pool text eol=lf
+rea-pool/leader text eol=lf
+*.dll binary
 * text=auto

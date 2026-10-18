@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+# Leader tool for Linux/macOS. Loads the settings written by setup.sh, then runs the tool.
+ENVFILE="$HOME/.rea-pool/env.sh"
+[ -f "$ENVFILE" ] && . "$ENVFILE"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec node "$DIR/src/leader.ts" "$@"

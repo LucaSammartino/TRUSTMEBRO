@@ -5,9 +5,11 @@
 #   -Mode friend       (default) set up, join if needed, then run
 #   -Mode setup-only   just set up (for the leader)
 #   -CheckOnly         only report what is missing; install nothing and ask nothing
+#   -Yes               do not ask, just install what is missing (for unattended use)
 param(
   [ValidateSet("friend", "setup-only")][string]$Mode = "friend",
-  [switch]$CheckOnly
+  [switch]$CheckOnly,
+  [switch]$Yes
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +26,7 @@ function Bad($text) { Say ("  [PROBLEM]  " + $text) Red; $script:Problems += $te
 
 function Ask($question) {
   if ($CheckOnly) { return $false }
+  if ($Yes) { return $true }
   $answer = Read-Host ($question + " (Y/n)")
   return ($answer -eq "" -or $answer -match "^[yY]")
 }
@@ -53,13 +56,13 @@ function Get-NodeMajor {
 
 function Ensure-Node {
   $major = Get-NodeMajor
-  if ($major -ge $Req.node.minimumMajor) { Ok ("Node.js " + $major); return }
-  if ($major -gt 0) { Missing ("Node.js is version " + $major + " but version " + $Req.node.minimumMajor + " or newer is needed") } else { Missing "Node.js (runs the pool tool)" }
-  if (-not (Has-Command "winget")) { Bad ("Windows' installer (winget) is not available. Install Node.js from " + $Req.node.manualUrl + " then run this again."); return }
-  if (Ask ("Install Node.js " + $Req.node.wingetVersion + " now? (small download; Windows may ask for permission)")) {
-    & winget install --id $Req.node.wingetId --version $Req.node.wingetVersion --exact --silent --accept-package-agreements --accept-source-agreements
+  if ($major -ge $Req.nodeMinimumMajor) { Ok ("Node.js " + $major); return }
+  if ($major -gt 0) { Missing ("Node.js is version " + $major + " but version " + $Req.nodeMinimumMajor + " or newer is needed") } else { Missing "Node.js (runs the pool tool)" }
+  if (-not (Has-Command "winget")) { Bad ("Windows' installer (winget) is not available. Install Node.js from " + $Req.nodeManualUrl + " then run this again."); return }
+  if (Ask ("Install Node.js " + $Req.nodeVersion + " now? (small download; Windows may ask for permission)")) {
+    & winget install --id $Req.nodeWingetId --version $Req.nodeVersion --exact --silent --accept-package-agreements --accept-source-agreements
     Refresh-Path
-    if ((Get-NodeMajor) -ge $Req.node.minimumMajor) { Ok "Node.js installed" } else { Bad ("Node.js did not install. Install it from " + $Req.node.manualUrl + ", then run this again.") }
+    if ((Get-NodeMajor) -ge $Req.nodeMinimumMajor) { Ok "Node.js installed" } else { Bad ("Node.js did not install. Install it from " + $Req.nodeManualUrl + ", then run this again.") }
   } else { Bad "Node.js is required." }
 }
 
@@ -77,7 +80,7 @@ function Get-JdkMajor($dir) {
 }
 
 function Find-Jdk {
-  $want = [int]$Req.java.major
+  $want = [int]$Req.javaMajor
   $candidates = @($env:JAVA_HOME, [Environment]::GetEnvironmentVariable("JAVA_HOME", "User"))
   foreach ($base in @("C:\Program Files\Eclipse Adoptium", "C:\Program Files\Java", "C:\Program Files\Microsoft", "C:\Program Files\Amazon Corretto", "C:\Program Files\Zulu")) {
     if (Test-Path $base) { $candidates += (Get-ChildItem $base -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) }
@@ -89,20 +92,20 @@ function Find-Jdk {
 function Ensure-Java {
   $jdk = Find-Jdk
   if (-not $jdk) {
-    Missing ("Java " + $Req.java.major + " (the full 'JDK', needed by Ghidra)")
-    if (-not (Has-Command "winget")) { Bad ("Install Java " + $Req.java.major + " (JDK) from " + $Req.java.manualUrl + " then run this again."); return }
-    if (Ask ("Install Java " + $Req.java.major + " now? (about 200 MB; Windows may ask for permission; your other Java versions stay)")) {
-      & winget install --id $Req.java.wingetId --exact --silent --accept-package-agreements --accept-source-agreements
+    Missing ("Java " + $Req.javaMajor + " (the full 'JDK', needed by Ghidra)")
+    if (-not (Has-Command "winget")) { Bad ("Install Java " + $Req.javaMajor + " (JDK) from " + $Req.javaManualUrl + " then run this again."); return }
+    if (Ask ("Install Java " + $Req.javaMajor + " now? (about 200 MB; Windows may ask for permission; your other Java versions stay)")) {
+      & winget install --id $Req.javaWingetId --exact --silent --accept-package-agreements --accept-source-agreements
       $jdk = Find-Jdk
     }
   }
-  if (-not $jdk) { Bad ("Java " + $Req.java.major + " is required."); return }
+  if (-not $jdk) { Bad ("Java " + $Req.javaMajor + " is required."); return }
   if ([Environment]::GetEnvironmentVariable("JAVA_HOME", "User") -ne $jdk) {
     if ($CheckOnly) { Missing ("JAVA_HOME should point at " + $jdk); return }
     Set-UserEnv "JAVA_HOME" $jdk
   }
   $env:JAVA_HOME = $jdk
-  Ok ("Java " + $Req.java.major + " at " + $jdk)
+  Ok ("Java " + $Req.javaMajor + " at " + $jdk)
 }
 
 # ---- Ghidra ------------------------------------------------------------------------------------
@@ -117,24 +120,24 @@ function Get-GhidraVersion($dir) {
 }
 
 function Ensure-Ghidra {
-  $want = $Req.ghidra.version
-  $default = Join-Path $ToolsDir $Req.ghidra.folderName
+  $want = $Req.ghidraVersion
+  $default = Join-Path $ToolsDir $Req.ghidraFolderName
   $dir = $null
   foreach ($candidate in @($env:GHIDRA_INSTALL_DIR, [Environment]::GetEnvironmentVariable("GHIDRA_INSTALL_DIR", "User"), $default)) {
     if ((Get-GhidraVersion $candidate) -eq $want) { $dir = $candidate; break }
   }
   if (-not $dir) {
     Missing ("Ghidra " + $want + " (the program that reads the software; free, from the NSA)")
-    $need = [math]::Ceiling($Req.ghidra.sizeMB * 3 / 1024)
+    $need = [math]::Ceiling($Req.ghidraSizeMB * 3 / 1024)
     if ((Free-SpaceGB) -lt $need) { Bad ("Not enough free disk space: Ghidra needs about " + $need + " GB free."); return }
-    if (Ask ("Download Ghidra " + $want + " (about " + $Req.ghidra.sizeMB + " MB) from github.com and unpack it into " + $ToolsDir + "?")) {
+    if (Ask ("Download Ghidra " + $want + " (about " + $Req.ghidraSizeMB + " MB) from github.com and unpack it into " + $ToolsDir + "?")) {
       New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
       $zip = Join-Path $ToolsDir "ghidra-download.zip"
       Say "  Downloading... this can take several minutes." Cyan
-      & curl.exe -L --fail --silent --show-error -o $zip $Req.ghidra.url
+      & curl.exe -L --fail --silent --show-error -o $zip $Req.ghidraUrl
       if ($LASTEXITCODE -ne 0) { Bad "The Ghidra download failed. Check your internet connection and run this again."; return }
       $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-      if ($hash -ne $Req.ghidra.sha256) {
+      if ($hash -ne $Req.ghidraSha256) {
         Remove-Item $zip -Force
         Bad "The downloaded Ghidra file did not match its published fingerprint, so it was deleted and NOT installed. Try again later."
         return
@@ -165,14 +168,14 @@ function Get-ReaVersion {
 }
 
 function Ensure-Rea {
-  $want = $Req.rea.version
+  $want = $Req.reaVersion
   $have = Get-ReaVersion
   if ($have -eq $want) { Ok ("rea " + $want); }
   else {
     if ($have) { Missing ("rea is version " + $have + " but this project uses " + $want) } else { Missing "rea (the tool that lets an AI read the software)" }
     if (-not (Has-Command "npm")) { Bad "npm is missing (it comes with Node.js). Open a NEW window and run this again."; return }
     if (Ask ("Install rea " + $want + " now?")) {
-      & npm install --global ($Req.rea.npmPackage + "@" + $want)
+      & npm install --global ($Req.reaNpmPackage + "@" + $want)
       Refresh-Path
       if ((Get-ReaVersion) -eq $want) { Ok ("rea " + $want + " installed") } else { Bad "rea did not install. Open a NEW window and run this again." }
     } else { Bad "rea is required."; return }

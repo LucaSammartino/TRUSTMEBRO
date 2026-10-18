@@ -14,13 +14,12 @@ It is built on [rea](https://github.com/morluto/rea) (which lets an AI read soft
 
 ## Start here
 
-- **Join a project (Windows):** double-click `rea-pool/START-HERE.cmd`. It checks what you need, asks before installing anything, and walks you through joining.
-- **Run a project:** double-click `rea-pool/SETUP-ONLY.cmd`, then `leader.cmd start <software file>` (see [`rea-pool/README.md`](rea-pool/README.md)).
-- **Why it is designed this way:** see [`research/`](research/README.md) for the research behind it and the Lua accuracy test.
+- **Join a project:** Windows: double-click `rea-pool/START-HERE.cmd`. macOS: double-click `rea-pool/START-HERE.command`. Linux: run `bash rea-pool/setup.sh`. It checks what you need, asks before installing anything, and walks you through joining.
+- **Run a project:** run the setup first (`SETUP-ONLY.cmd`, or `bash setup.sh --mode setup-only`), then `leader.cmd start <software file>` (Windows) or `./leader start <software file>` (Linux/macOS). See [`rea-pool/README.md`](rea-pool/README.md).
 
 ## Honest status
 
-Early (v0.2). The pool logic has 21 automated tests, and rea + Ghidra analysis works on Windows programs. **Not yet tested:** a real second computer, a clean Windows install of the installer, and the Claude command-line step end to end. In our one accuracy test (29 Lua functions with names hidden), an AI got the right name or purpose about 59% of the time; Lua is probably in its training data, so expect worse on unfamiliar software. Results are strong suggestions, not proof.
+Early (v0.2). Runs on **Windows, Linux and macOS** (Apple Silicon included): automated tests on all three check the pool's rules (24 tests), a clean-room install, and a real Ghidra analysis, and confirm every system finds the same functions in the same program. **Not yet tested:** two real computers over a network, a clean Windows install of the Node/Java installers, and the Claude command-line step end to end. In our one accuracy test (29 Lua functions with names hidden), an AI got the right name or purpose about 59% of the time; Lua is probably in its training data, so expect worse on unfamiliar software. Results are strong suggestions, not proof.
 
 ## Please use it responsibly
 

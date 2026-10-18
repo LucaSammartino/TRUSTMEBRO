@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main, portable-ci]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: rea-pool
+
+jobs:
+  # Fast checks on all three systems: the pool's rules and the scripts' syntax. No Ghidra needed.
+  unit-tests:
+    name: Unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
+      - name: Shell scripts parse (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          for f in setup.sh pool leader START-HERE.command; do bash -n "$f" && echo "$f ok"; done
+      - name: PowerShell script parses (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\setup.ps1", [ref]$null, [ref]$errors)
+          if ($errors) { $errors; exit 1 } else { "setup.ps1 parses" }
+
+  # A clean-room install on Linux and macOS: everything goes into a fresh home folder using setup.sh,
+  # then the real rea + Ghidra analysis and a full leader/contributor run.
+  install-and-e2e-unix:
+    name: Install + real analysis (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install with setup.sh into a fresh home, then run the end-to-end test
+        run: |
+          export HOME="$RUNNER_TEMP/fresh-home"
+          mkdir -p "$HOME"
+          chmod +x setup.sh pool leader
+          ./setup.sh --mode setup-only --yes --ignore-existing
+          . "$HOME/.rea-pool/env.sh"
+          echo "--- tools in use"
+          node --version
+          "$JAVA_HOME/bin/java" -version
+          echo "GHIDRA_INSTALL_DIR=$GHIDRA_INSTALL_DIR"
+          rea --version
+          echo "--- rea doctor"
+          rea doctor --provider ghidra --json | head -c 3000 || true
+          echo
+          echo "--- end-to-end"
+          export E2E_FUNCTIONS_OUT="$RUNNER_TEMP/functions-${{ runner.os }}.txt"
+          node test/e2e.ts test/fixtures/lua54.dll
+          cp "$E2E_FUNCTIONS_OUT" "$GITHUB_WORKSPACE/functions-${{ runner.os }}.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: functions-${{ runner.os }}
+          path: functions-${{ runner.os }}.txt
+          if-no-files-found: ignore
+
+  install-and-e2e-windows:
+    name: Install + real analysis (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Install what is missing with setup.ps1, then run the end-to-end test
+        shell: powershell
+        run: |
+          # Node and Java come from the steps above, so setup.ps1 installs Ghidra and rea itself.
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -Mode setup-only -Yes
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $env:GHIDRA_INSTALL_DIR = [Environment]::GetEnvironmentVariable("GHIDRA_INSTALL_DIR", "User")
+          $env:REA_ANALYSIS_PROVIDER = "ghidra"
+          $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+          rea --version
+          rea doctor --provider ghidra --json | Select-Object -First 40
+          $env:E2E_FUNCTIONS_OUT = "$PWD\functions-Windows.txt"
+          node test/e2e.ts test/fixtures/lua54.dll
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: functions-Windows
+          path: rea-pool/functions-Windows.txt
+          if-no-files-found: ignore
+
+  # The same program must give every operating system the same list of functions, or friends on different
+  # systems would be talking about different things.
+  same-functions-everywhere:
+    name: Same functions on every system
+    runs-on: ubuntu-latest
+    needs: [install-and-e2e-unix, install-and-e2e-windows]
+    if: always()
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: found
+          pattern: functions-*
+          merge-multiple: true
+      - name: Compare
+        run: |
+          ls -la found || true
+          cat found/*.txt || true
+          count=$(cat found/*.txt 2>/dev/null | awk '{print $3}' | sort -u | wc -l)
+          files=$(ls found/*.txt 2>/dev/null | wc -l)
+          if [ "$files" -lt 2 ]; then echo "Fewer than two systems produced a list; nothing to compare."; exit 1; fi
+          if [ "$count" -ne 1 ]; then echo "DIFFERENT function lists between systems!"; exit 1; fi
+          echo "All $files systems found the identical list of functions."

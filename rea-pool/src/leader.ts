@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Leader tool. One command does the setup:  leader start <software-file>
 import { randomBytes } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { runCommand } from "./exec.ts";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { networkInterfaces } from "node:os";
@@ -76,17 +76,14 @@ function newJoinCode(): string {
 
 function listFunctions(file: string): Pick<Task, "id" | "label" | "address">[] {
   console.log("Asking rea to list every function (the first run can take a minute)...");
-  if (/["&|<>^%]/.test(file)) {
-    console.error("The software file's path contains characters this tool cannot use. Move the file to a simpler folder.");
+  let run;
+  try {
+    run = runCommand("rea", ["search", file, ".", "--kind", "procedures", "--mode", "regex", "--provider", "ghidra", "--json"], { timeout: 15 * 60_000, maxBuffer: 256 * 1024 * 1024 });
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
     process.exit(1);
   }
-  const run = spawnSync(`rea search "${file}" . --kind procedures --mode regex --provider ghidra --json`, {
-    encoding: "utf8",
-    shell: true,
-    maxBuffer: 256 * 1024 * 1024,
-    timeout: 15 * 60_000,
-  });
-  if (run.status !== 0) {
+  if (run.error || run.status !== 0) {
     console.error(`rea failed. Run "rea doctor --provider ghidra" to see what is wrong.\n${(run.stderr ?? "").slice(0, 600)}`);
     process.exit(1);
   }

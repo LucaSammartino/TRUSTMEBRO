@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { IS_WINDOWS, runCommand } from "./exec.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Project, ToolSpec } from "./types.ts";
@@ -40,9 +40,13 @@ export function readVersion(tool: ToolSpec): { version: string } | { error: stri
   }
   const [rawProgram, ...args] = tool.command;
   // Use the Java that JAVA_HOME points at (that is the one Ghidra will use), not whatever is first on the PATH.
-  const program = rawProgram === "java" && process.env.JAVA_HOME ? `"${join(process.env.JAVA_HOME, "bin", "java")}"` : rawProgram;
-  // Safe to join into one string: the program and arguments were already checked against the allowlists above.
-  const run = spawnSync([program, ...args].join(" "), { encoding: "utf8", shell: true, timeout: 15000 });
+  const program = rawProgram === "java" && process.env.JAVA_HOME ? join(process.env.JAVA_HOME, "bin", IS_WINDOWS ? "java.exe" : "java") : rawProgram;
+  let run;
+  try {
+    run = runCommand(program, args, { timeout: 15000 });
+  } catch {
+    return { error: `${tool.name} is installed in a folder whose name this tool cannot use. Move it to a simpler path.` };
+  }
   if (run.error || run.status === null) return { error: `${tool.name} was not found on this computer.` };
   const output = `${run.stdout ?? ""}
 ${run.stderr ?? ""}`;
