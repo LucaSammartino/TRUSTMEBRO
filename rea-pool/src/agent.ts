@@ -3,8 +3,10 @@
 //   review:  ask rea for the same code, ask an AI whether someone else's name and description are right
 import { spawn, spawnSync } from "node:child_process";
 import { runCommand, runCommandAsync, runUserCommand } from "./exec.ts";
-import { calleesFromReaFunction } from "./graph.ts";
-import { shapeOf } from "./similar.ts";
+import { addCallees, calleesFromReaFunction, cleanCallees } from "./graph.ts";
+import { isShape, shapeOf } from "./similar.ts";
+import { loadDump, lookupFunction } from "./prepare.ts";
+import type { State } from "./types.ts";
 
 export interface AgentContext {
   targetPath: string;
@@ -35,8 +37,41 @@ function parseInspected(stdout: string, address: string): { code: string; callee
   return { code: code.replace(/\r/g, "").trim().slice(0, 6000), callees: calleesFromReaFunction(result, address), shape: shapeOf(code) };
 }
 
+/** From the local cache made by `pool prepare`, if this function is in it. No process is started. */
+function fromCache(targetPath: string, address: string): { code: string; callees: string[]; shape: string | null } | null {
+  const entry = lookupFunction(targetPath, address);
+  if (!entry) return null;
+  return { code: entry.code.replace(/\r/g, "").trim().slice(0, 6000), callees: cleanCallees(entry.callees, address), shape: shapeOf(entry.code) };
+}
+
+/** Fill callees (and fingerprints) of analysis tasks straight from the local dump. Changes `state`; returns how many tasks changed. */
+export function fillCalleesFromDump(state: State, targetPath: string): number {
+  const dump = loadDump(targetPath);
+  if (!dump) return 0;
+  let filled = 0;
+  for (const task of state.tasks) {
+    if ((task.kind ?? "analyze") !== "analyze") continue;
+    const entry = lookupFunction(targetPath, task.address);
+    if (!entry) continue;
+    let changed = false;
+    if (task.callees === undefined) {
+      addCallees(task, cleanCallees(entry.callees, task.address));
+      changed = true;
+    }
+    const shape = shapeOf(entry.code);
+    if (shape && !task.shape && isShape(shape)) {
+      task.shape = shape;
+      changed = true;
+    }
+    if (changed) filled++;
+  }
+  return filled;
+}
+
 /** One rea call returns both the pseudocode and the functions it calls. */
 export function inspectFunction(targetPath: string, address: string): { code: string; callees: string[]; shape: string | null } {
+  const cached = fromCache(targetPath, address);
+  if (cached) return cached;
   const run = runCommand("rea", reaArgs(targetPath, address), { timeout: REA_TIMEOUT });
   if (run.error) throw new Error(`Could not start rea: ${run.error.message}`);
   if (run.status !== 0) throw new Error(`rea failed: ${(run.stderr ?? "").slice(0, 400)}`);
@@ -45,6 +80,8 @@ export function inspectFunction(targetPath: string, address: string): { code: st
 
 /** Same as inspectFunction, but does not block the event loop. */
 export async function inspectFunctionAsync(targetPath: string, address: string): Promise<{ code: string; callees: string[]; shape: string | null }> {
+  const cached = fromCache(targetPath, address);
+  if (cached) return cached;
   const run = await runCommandAsync("rea", reaArgs(targetPath, address), { timeout: REA_TIMEOUT });
   if (run.error) throw new Error(`Could not start rea: ${run.error.message}`);
   if (run.status !== 0) throw new Error(`rea failed: ${(run.stderr ?? "").slice(0, 400)}`);

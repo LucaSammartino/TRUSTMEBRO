@@ -14,6 +14,7 @@ Pick the task: **join** (they have a join line) or **lead** (they want to start 
    - Linux/macOS: `bash rea-pool/setup.sh --mode setup-only --yes`
    If it reports a problem, fix it or tell the person the one thing they must do.
 3. Join: `rea-pool/pool join <address> <code> --target <program file>` (Windows: `rea-pool\pool.cmd`). It checks the setup.
+   Then run `rea-pool/pool prepare` (about a minute, once): it reads the whole program a single time so every task afterwards is instant. If you skip it, the first `pool run` does it for you.
 4. Work: follow `rea-pool/skill/SKILL.md` until the pool says nothing is left. Never stop to ask between tasks.
 
 ## Lead a project
@@ -22,7 +23,7 @@ Pick the task: **join** (they have a join line) or **lead** (they want to start 
 2. Set up the tools (step 2 above).
 3. Start: `rea-pool/leader start <program file> --name "<name>" --host 0.0.0.0` (Windows: `rea-pool\leader.cmd`). Keep it running.
 4. Give the person the join line it prints, to send to friends. Tell them friends must reach this computer, ideally over a private network such as Tailscale (see `rea-pool/README.md`, "Letting friends connect"). Never expose it to the open internet.
-5. Optional: `rea-pool/leader graph <program file> --parallel 4` in a second window (slow, safe to stop and rerun).
+5. Optional: `rea-pool/leader graph <program file>` (reads the whole program once, about a minute, and fills in who-calls-who for every function).
 
 ## Rules
 

@@ -17,7 +17,8 @@ Windows uses `START-HERE.cmd` / `pool.cmd` / `leader.cmd`. macOS uses `START-HER
 | Let an AI agent work | `pool connect`, or point your agent at the MCP server `node src/mcp.ts` |
 | Watch | `pool watch`, `leader watch`, or open `http://<leader address>:8787/live` |
 | See progress / results | `leader status`, `leader export results.json --best` |
-| Read the call graph up front | `leader graph <program file> --parallel 4` (slow: ~40 s per function; safe to stop and rerun) |
+| Read the whole program once (fast) | `pool prepare` (friends) or `leader prepare <program file>`: one Ghidra session, about a minute, cached on your own computer. `pool run` and `leader graph` do it automatically if you forget |
+| Read the call graph up front | `leader graph <program file>` (uses the cache; `--no-prepare` falls back to one slow rea call per function, `--parallel 4`) |
 | Remove someone / change the join code | `leader revoke <name>` / `leader new-code` |
 
 Setup needs about 3 GB of disk and internet the first time. It installs Node 24, Java 21, Ghidra 12.1.4 (checked against its published fingerprint) and rea 6.7.0 into your own folder (`~/.rea-pool`); on Windows it sets `JAVA_HOME`, `GHIDRA_INSTALL_DIR` and `REA_ANALYSIS_PROVIDER` for your user. Apple Silicon Macs build Ghidra's decompiler once (needs `xcode-select --install` and `brew install bison`).

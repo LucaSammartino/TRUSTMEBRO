@@ -2,6 +2,8 @@
 // Leader tool. One command does the setup:  leader start <software-file>
 import { randomBytes } from "node:crypto";
 import { runCommand, runCommandAsync } from "./exec.ts";
+import { fillCalleesFromDump } from "./agent.ts";
+import { loadDump, prepareTarget } from "./prepare.ts";
 import { addCallees, calleesFromReaFunction, graphStats, normalizeAddress } from "./graph.ts";
 import { isShape, shapeOf } from "./similar.ts";
 import { existsSync, mkdirSync, statSync } from "node:fs";
@@ -64,8 +66,12 @@ function usage(): never {
                                       List what has been sent in
   export <out.json> [--best] [--include-unverified]
                                       Save trusted results (--best: one winner per function and kind)
-  graph <software-file> [--parallel 4] [--limit N]
-                                      Read which function calls which (slow: ~40s per function, run in
+  prepare <software-file> [--force]   Read the whole program once into a local cache (about a minute);
+                                      after this, graph and every task are instant
+  graph <software-file> [--no-prepare] [--parallel 4] [--limit N]
+                                      Read which function calls which. Prepares the cache first (see
+                                      "prepare"). With --no-prepare, or for functions missing from the
+                                      cache, asks rea one function at a time (slow: ~40s each, in
                                       parallel). Safe to stop with Ctrl+C and run again to continue.
   revoke <person>                     Cancel someone's access
   approve <note-id> | reject <note-id>
@@ -187,6 +193,32 @@ async function buildGraph(file: string, dataDir: string, statePath: string, flag
   const graph: Record<string, string[]> = existsSync(graphPath) ? readJson<Record<string, string[]>>(graphPath) : {};
   const shapesPath = join(dataDir, "shapes.json");
   const shapes: Record<string, string> = existsSync(shapesPath) ? readJson<Record<string, string>>(shapesPath) : {};
+
+  if (flags["no-prepare"] === undefined) {
+    try {
+      if (!loadDump(file)) {
+        console.log("Preparing a local copy of the program once (about a minute)...");
+        await prepareTarget(file, { log: console.log });
+      }
+      const state = loadState(statePath);
+      const filled = fillCalleesFromDump(state, file);
+      if (filled > 0) {
+        for (const t of state.tasks) {
+          if ((t.kind ?? "analyze") !== "analyze") continue;
+          const key = normalizeAddress(t.address) ?? t.address;
+          if (t.callees && !graph[key]) graph[key] = t.callees;
+          if (t.shape && !shapes[key]) shapes[key] = t.shape;
+        }
+        writeJsonAtomic(graphPath, graph);
+        writeJsonAtomic(shapesPath, shapes);
+        // Short read-modify-write: reload so changes made by the running server are not lost.
+        mergeGraphIntoState(statePath, graph, shapes);
+        console.log(`Filled ${filled} functions from the local cache.`);
+      }
+    } catch (err) {
+      console.log(`Could not use the quick method (${err instanceof Error ? err.message : err}); using the slower one.`);
+    }
+  }
 
   const first = loadState(statePath);
   const isCandidate = (t: Task) => (t.kind ?? "analyze") === "analyze" && t.callees === undefined;
@@ -400,6 +432,21 @@ async function main() {
           // The server may be mid-write; the next frame will do.
         }
       }, 3000);
+      break;
+    }
+    case "prepare": {
+      const file = rest[0];
+      if (!file || !existsSync(file)) {
+        console.error("Give the path to your copy of the software: prepare <software-file> [--force]");
+        process.exit(1);
+      }
+      try {
+        const r = await prepareTarget(file, { force: flags.force !== undefined, log: console.log });
+        console.log(r.fromCache ? `Already prepared: ${r.functions} functions` : `Ready: ${r.functions} functions cached (took ${r.seconds}s)`);
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
       break;
     }
     case "graph": {

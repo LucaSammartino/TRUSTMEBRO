@@ -13,6 +13,7 @@ import { analyzeAsync, detectAi, inspectFunction, reviewAsync, type AgentContext
 import type { Activity } from "./activity.ts";
 import { renderActivity } from "./watch.ts";
 import { runMcpServer } from "./mcp.ts";
+import { loadDump, prepareTarget } from "./prepare.ts";
 
 interface Config {
   leaderUrl: string;
@@ -191,6 +192,37 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
   if (!flags.once) console.log(`\nNothing left to do. You finished ${done} task(s). Thank you!`);
 }
 
+/** Make the local copy of the program (once). With `quiet`, a failure only prints one line and the slower method is used. */
+async function ensurePrepared(config: Config, opts: { force?: boolean; quiet?: boolean } = {}): Promise<void> {
+  // When this runs on its own (pool run / pool next) messages go to stderr, so stdout stays clean for agents reading it.
+  const say = opts.quiet ? console.error : console.log;
+  if (!config.targetPath) {
+    if (opts.quiet) return;
+    console.error("No copy of the software is set yet. Use: pool set-target <path>");
+    process.exit(1);
+  }
+  if (opts.quiet) {
+    try {
+      if (loadDump(config.targetPath)) return;
+    } catch {
+      // Treated like no cache.
+    }
+    say("Preparing your copy once (about a minute); after this every task is instant...");
+  }
+  try {
+    const r = await prepareTarget(config.targetPath, { force: opts.force, log: say });
+    say(r.fromCache ? `Already prepared: ${r.functions} functions` : `Ready: ${r.functions} functions cached (took ${r.seconds}s)`);
+  } catch (err) {
+    const why = (err instanceof Error ? err.message : String(err)).split("\n")[0];
+    if (opts.quiet) {
+      say(`Could not prepare your copy (${why}); using the slower method, about 40 seconds per task.`);
+      return;
+    }
+    console.error(why);
+    process.exit(1);
+  }
+}
+
 /** Redraw the project dashboard every few seconds. Network trouble shows a message and keeps trying. */
 async function watchLoop(config: Config, once: boolean): Promise<void> {
   const tty = Boolean(process.stdout.isTTY);
@@ -272,9 +304,15 @@ async function main() {
       if (s.finished) console.log("Nothing left for you to do right now.");
       break;
     }
-    case "run":
-      await runLoop(loadConfig(), flags);
+    case "prepare":
+      await ensurePrepared(loadConfig(), { force: flags.force !== undefined });
       break;
+    case "run": {
+      const config = loadConfig();
+      await ensurePrepared(config, { quiet: true });
+      await runLoop(config, flags);
+      break;
+    }
     case "watch":
       await watchLoop(loadConfig(), flags.once === "true");
       break;
@@ -292,6 +330,7 @@ async function main() {
     case "next": {
       // For an AI agent working by hand (see the skill): print the current task with everything needed to do it.
       const config = loadConfig();
+      await ensurePrepared(config, { quiet: true });
       const claim = await api<ClaimReply>(config, "POST", "/claim");
       if (!claim.task) {
         console.log(JSON.stringify({ task: null, finished: claim.finished }));
@@ -370,6 +409,7 @@ async function main() {
   join <address> <join-code> --target <file>   Join a project (--name to pick a name)
   run                                          Do tasks until there are none left (add --once for just one)
   watch [--once]                               Live dashboard of the project (refreshes every 3 seconds)
+  prepare [--force]                            Read your copy of the software once (about a minute) so every task is instant
   check                                        Check your setup matches the project
   status                                       See progress
   set-target <path>                            Change where your copy of the software is
