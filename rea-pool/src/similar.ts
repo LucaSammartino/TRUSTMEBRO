@@ -2,7 +2,7 @@
 // helpers). Such copies decompile to the same shape, so a name found for one is a useful hint for the others.
 import { createHash } from "node:crypto";
 import type { State, Task } from "./types.ts";
-import { normalizeAddress, trustedName } from "./graph.ts";
+import { normalizeAddress, trustedName, type Index, type ShapeInfo } from "./graph.ts";
 
 /** Shorter than this and "the same shape" means nothing: thousands of functions are just `return 0;`. */
 const MIN_SHAPE_LENGTH = 120;
@@ -33,9 +33,27 @@ export function isShape(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{16}$/.test(value);
 }
 
-function twinsOf(state: State, task: Task): Task[] {
+function twinsOf(state: State, task: Task, idx?: Index): Task[] {
   if (!task.shape) return [];
+  if (idx) return (idx.shapes.get(task.shape) ?? []).filter((t) => t !== task);
   return state.tasks.filter((t) => (t.kind ?? "analyze") === "analyze" && t !== task && t.shape === task.shape);
+}
+
+/** Per-shape summary, computed once per index: the first few named copies and how many copies are not done. */
+function shapeInfo(state: State, shape: string, idx: Index): ShapeInfo {
+  let info = idx.shapeInfo.get(shape);
+  if (info) return info;
+  info = { named: [], notDone: 0, members: new Set() };
+  for (const t of idx.shapes.get(shape) ?? []) {
+    info.members.add(t);
+    if (t.state !== "done") info.notDone++;
+    if (info.named.length > MAX_TWIN_HINTS) continue;
+    const address = normalizeAddress(t.address);
+    const name = address ? trustedName(state, address, idx) : undefined;
+    if (address && name) info.named.push({ task: t, address, name });
+  }
+  idx.shapeInfo.set(shape, info);
+  return info;
 }
 
 export interface TwinHint {
@@ -44,8 +62,17 @@ export interface TwinHint {
 }
 
 /** Trusted names of functions that look like copies of this one. A hint for whoever works on it, never a verdict. */
-export function twinHints(state: State, task: Task): TwinHint[] {
+export function twinHints(state: State, task: Task, idx?: Index): TwinHint[] {
   const out: TwinHint[] = [];
+  if (idx) {
+    if (!task.shape) return out;
+    for (const n of shapeInfo(state, task.shape, idx).named) {
+      if (n.task === task) continue;
+      out.push({ address: n.address, name: n.name });
+      if (out.length >= MAX_TWIN_HINTS) break;
+    }
+    return out;
+  }
   for (const twin of twinsOf(state, task)) {
     const address = normalizeAddress(twin.address);
     const name = address ? trustedName(state, address) : undefined;
@@ -59,7 +86,13 @@ export function twinHints(state: State, task: Task): TwinHint[] {
  * How many copies of this function are still waiting, when none of the copies has a trusted name yet. Doing such a
  * function first pays off the most: every copy then starts with a hint instead of from nothing.
  */
-export function twinPotential(state: State, task: Task): number {
-  if (!task.shape || twinHints(state, task).length > 0) return 0;
+export function twinPotential(state: State, task: Task, idx?: Index): number {
+  if (!task.shape) return 0;
+  if (idx) {
+    if (twinHints(state, task, idx).length > 0) return 0;
+    const info = shapeInfo(state, task.shape, idx);
+    return info.notDone - (info.members.has(task) && task.state !== "done" ? 1 : 0);
+  }
+  if (twinHints(state, task).length > 0) return 0;
   return twinsOf(state, task).filter((t) => t.state !== "done").length;
 }

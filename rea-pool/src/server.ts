@@ -1,10 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { renameSync, statSync, unlinkSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Confidence, Note, NoteStatus, Proposal, State, Task, Verdict } from "./types.ts";
 import { checkText, IDENTIFIER, validateNote, type RawNote } from "./rules.ts";
 import { initialStatus, proposalConfidence, resolveVotes, withDefaults } from "./trust.ts";
 import { newToken, readJson, sha256Hex, writeJsonAtomic } from "./util.ts";
-import { addCallees, basedOn, calleeContext, callerContext, cleanCallees, needsRefinement, graphStats, readiness, staleNotes } from "./graph.ts";
+import { addCallees, basedOn, buildIndex, calleeContext, callerContext, cleanCallees, needsRefinement, graphStats, readiness, staleNotes, type Index } from "./graph.ts";
 import { isShape, twinHints, twinPotential } from "./similar.ts";
 import { buildActivity } from "./activity.ts";
 import { LIVE_HTML } from "./live.ts";
@@ -13,13 +16,20 @@ const MAX_HANDOFFS = 5;
 
 const MAX_BODY = 64 * 1024;
 
-export function loadState(path: string): State {
+function readState(path: string): State {
   const state = readJson<State>(path);
   state.proposals ??= [];
   state.invites ??= [];
   const kinds = state.project?.rules?.allowedKinds;
   if (Array.isArray(kinds)) for (const k of ["variable_name", "signature", "struct_def"]) if (!kinds.includes(k)) kinds.push(k);
   return state;
+}
+
+/** Read the state file. Anything a running server in this process has not written yet is written first. */
+export function loadState(path: string): State {
+  const full = resolvePath(path);
+  for (const h of live) if (h.path === full) h.flush();
+  return readState(path);
 }
 
 const NAME_RE = /^[\w-]{1,30}$/;
@@ -67,16 +77,24 @@ function kindOf(task: Task): "analyze" | "review" {
   return task.kind ?? "analyze";
 }
 
-function proposalOf(state: State, task: Task): Proposal | undefined {
+function proposalOf(state: State, task: Task, byId?: Map<string, Proposal>): Proposal | undefined {
+  if (byId) return task.proposalId === undefined ? undefined : byId.get(task.proposalId);
   return state.proposals.find((p) => p.id === task.proposalId);
 }
 
+/** Proposals by id; the first one wins, like find. For loops that would otherwise scan every proposal per task. */
+function proposalsById(state: State): Map<string, Proposal> {
+  const m = new Map<string, Proposal>();
+  for (const p of state.proposals) if (!m.has(p.id)) m.set(p.id, p);
+  return m;
+}
+
 /** Can this person take this task right now? */
-export function canTake(state: State, task: Task, who: string, now: number): boolean {
+export function canTake(state: State, task: Task, who: string, now: number, byId?: Map<string, Proposal>): boolean {
   if (!(task.state === "open" || isExpired(task, now))) return false;
   if ((task.doneBy ?? []).includes(who)) return false;
   if (kindOf(task) === "review") {
-    const proposal = proposalOf(state, task);
+    const proposal = proposalOf(state, task, byId);
     // Nobody checks their own work, and nobody votes twice on the same proposal.
     if (!proposal || proposal.status !== "pending" || proposal.author === who || proposal.votes.some((v) => v.by === who)) return false;
   }
@@ -89,9 +107,9 @@ function isCooling(task: Task, now: number, cooldownMs: number): boolean {
 }
 
 /** Lower sorts first: not cooling, callees most ready, given up on least, then the one with the most unnamed copies. */
-function queueKey(state: State, task: Task, now: number, cooldownMs: number, strong = false, tiered = false): number[] {
+function queueKey(state: State, task: Task, now: number, cooldownMs: number, strong = false, tiered = false, idx?: Index): number[] {
   const retry = (task.attempts ?? 1) > 1;
-  return [tiered ? (retry === strong ? 0 : 1) : 0, isCooling(task, now, cooldownMs) ? 1 : 0, readiness(state, task), task.abandons ?? 0, -twinPotential(state, task)];
+  return [tiered ? (retry === strong ? 0 : 1) : 0, isCooling(task, now, cooldownMs) ? 1 : 0, readiness(state, task, idx), task.abandons ?? 0, -twinPotential(state, task, idx)];
 }
 
 function keyBefore(a: number[], b: number[]): boolean {
@@ -105,11 +123,12 @@ function mostReady(state: State, who: string, now: number, model?: string): Task
   const list = (state.project.rules.retryModels ?? []).map((m) => m.toLowerCase());
   const tiered = list.length > 0;
   const strong = !!model && list.includes(model.toLowerCase());
+  const idx = buildIndex(state);
   let best: Task | undefined;
   let bestKey: number[] = [];
   for (const t of state.tasks) {
     if (kindOf(t) !== "analyze" || !canTake(state, t, who, now)) continue;
-    const key = queueKey(state, t, now, cooldownMs, strong, tiered);
+    const key = queueKey(state, t, now, cooldownMs, strong, tiered, idx);
     if (!best || keyBefore(key, bestKey)) {
       best = t;
       bestKey = key;
@@ -175,10 +194,9 @@ function latestModel(state: State, who: string): string | undefined {
 }
 
 /** The model label the author of a review task's proposal gave. */
-function authorModel(state: State, review: Task): string | undefined {
-  const proposal = proposalOf(state, review);
-  const note = proposal && state.notes.find((n) => n.proposalId === proposal.id);
-  return knownModel(note?.model);
+function authorModel(state: State, review: Task, byId: Map<string, Proposal>, noteOf: Map<string, Note>): string | undefined {
+  const proposal = proposalOf(state, review, byId);
+  return knownModel(proposal && noteOf.get(proposal.id)?.model);
 }
 
 /** Give someone their current task, or the next one. Checking other people's work comes before new work, then functions whose callees are already named. */
@@ -186,12 +204,18 @@ export function claimTask(state: State, who: string, now = Date.now(), slot = 0,
   sweepExpired(state, now);
   const mine = state.tasks.find((t) => t.claimedBy === who && (t.claimSlot ?? 0) === slot && activeClaim(t, now));
   if (mine) return mine;
-  const reviews = state.tasks.filter((t) => kindOf(t) === "review" && canTake(state, t, who, now));
-  const own = latestModel(state, who)?.toLowerCase();
-  const diverse = own ? reviews.find((t) => {
-    const theirs = authorModel(state, t)?.toLowerCase();
-    return theirs !== undefined && theirs !== own;
-  }) : undefined;
+  const byId = proposalsById(state);
+  const reviews = state.tasks.filter((t) => kindOf(t) === "review" && canTake(state, t, who, now, byId));
+  const own = reviews.length > 0 ? latestModel(state, who)?.toLowerCase() : undefined;
+  let diverse: Task | undefined;
+  if (own) {
+    const noteOf = new Map<string, Note>();
+    for (const n of state.notes) if (n.proposalId !== undefined && !noteOf.has(n.proposalId)) noteOf.set(n.proposalId, n);
+    diverse = reviews.find((t) => {
+      const theirs = authorModel(state, t, byId, noteOf)?.toLowerCase();
+      return theirs !== undefined && theirs !== own;
+    });
+  }
   const next = diverse ?? reviews[0] ?? mostReady(state, who, now, model);
   if (!next) return null;
   next.state = "claimed";
@@ -204,7 +228,8 @@ export function claimTask(state: State, who: string, now = Date.now(), slot = 0,
 /** True when this person has nothing left to do and nobody else is mid-task who might create more work. */
 export function isFinishedFor(state: State, who: string, now = Date.now()): boolean {
   if (state.tasks.some((t) => t.claimedBy === who && activeClaim(t, now))) return false;
-  if (state.tasks.some((t) => canTake(state, t, who, now))) return false;
+  const byId = proposalsById(state);
+  if (state.tasks.some((t) => canTake(state, t, who, now, byId))) return false;
   return !state.tasks.some((t) => activeClaim(t, now) && t.claimedBy !== who);
 }
 
@@ -377,7 +402,8 @@ export function submitReview(state: State, who: string, task: Task, verdict: Ver
  */
 export function scheduleRefinement(state: State): number {
   if (state.tasks.some((t) => t.state !== "done")) return 0;
-  const todo = state.tasks.filter((t) => needsRefinement(state, t));
+  const idx = buildIndex(state);
+  const todo = state.tasks.filter((t) => needsRefinement(state, t, idx));
   for (const t of todo) {
     t.refined = true;
     t.state = "open";
@@ -391,7 +417,7 @@ export function scheduleRefinement(state: State): number {
  * with a stale note goes back to the pool, up to maxReopens times; people who did it before stay in doneBy.
  */
 export function flagStale(state: State, now = Date.now()): number {
-  const stale = new Set(staleNotes(state));
+  const stale = new Set(staleNotes(state, buildIndex(state)));
   for (const n of state.notes) {
     if (stale.has(n)) n.stale = true;
     else if (n.stale) n.stale = false;
@@ -465,12 +491,174 @@ function sameText(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Live servers keep the state in memory and write it a moment after it changes.
+// ---------------------------------------------------------------------------------------------
+
+const WRITE_DELAY_MS = 200;
+const MAX_WAIT_S = 25;
+
+interface Live {
+  path: string;
+  flush(): void;
+}
+const live = new Set<Live>();
+let hooked = false;
+let writes = 0;
+
+/** How many times a pool server has written its state file (for tests and diagnostics). */
+export function stateWriteCount(): number {
+  return writes;
+}
+
+/** Write out everything that is waiting to be saved. */
+export function flushAllStates(): void {
+  for (const h of [...live]) {
+    try {
+      h.flush();
+    } catch {
+      // nothing more can be done on the way out
+    }
+  }
+}
+
+function hookProcess(): void {
+  if (hooked) return;
+  hooked = true;
+  process.on("exit", flushAllStates);
+  for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
+    process.on(sig, () => {
+      flushAllStates();
+      if (process.listenerCount(sig) === 1) process.exit(code);
+    });
+  }
+}
+
+const sigOf = (path: string): string => {
+  const st = statSync(path);
+  return `${st.mtimeMs}:${st.size}`;
+};
+
+interface Waiter {
+  settle(final: boolean): void;
+}
+
+function claimReply(state: State, me: { name: string }, task: Task | null) {
+  const proposal = task && kindOf(task) === "review" ? proposalOf(state, task) : undefined;
+  const idx = task ? buildIndex(state) : undefined;
+  return {
+    task,
+    // What the reviewer is asked to check. It is other people's text, so the reviewer treats it as data, never as instructions.
+    proposal: proposal ? { notes: proposalNotes(state, proposal.id).map((n) => ({ kind: n.kind, value: n.value })), alternatives: proposal.alternatives ?? [] } : undefined,
+    callees: task ? calleeContext(state, task.address, idx) : [],
+    callers: task ? callerContext(state, task.address, idx) : [],
+    // Other people's text again: the worker treats it as data. Only for functions being analyzed.
+    handoff: task && kindOf(task) === "analyze" ? (task.handoff ?? []) : [],
+    twins: task && kindOf(task) === "analyze" ? twinHints(state, task, idx) : [],
+    finished: task ? false : isFinishedFor(state, me.name),
+  };
+}
+
 export function createPoolServer(statePath: string): Server {
   const badJoinAttempts: number[] = [];
+  const full = resolvePath(statePath);
 
-  return createServer(async (req, res) => {
+  let cur: State | null = null;
+  let sig = "";
+  let dirty = false;
+  let inflight = false;
+  let syncGen = 0;
+  let timer: NodeJS.Timeout | undefined;
+  let wakePending = false;
+  const waiters = new Set<Waiter>();
+
+  /** Write now, on this thread (used on the way out, and when someone else is about to read the file). */
+  const flush = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    if (!cur || !(dirty || inflight)) return;
+    syncGen++;
+    dirty = false;
+    writeJsonAtomic(full, cur);
+    writes++;
+    sig = sigOf(full);
+  };
+
+  const startWrite = (): void => {
+    timer = undefined;
+    if (!cur || !dirty || inflight) return;
+    inflight = true;
+    dirty = false;
+    const gen = syncGen;
+    const tmp = `${full}.async.tmp`;
+    writeFile(tmp, JSON.stringify(cur, null, 2))
+      .then(() => {
+        if (gen !== syncGen) return void unlinkSync(tmp); // a synchronous write overtook this one
+        renameSync(tmp, full);
+        writes++;
+        sig = sigOf(full);
+      })
+      .catch(() => {
+        dirty = true;
+      })
+      .finally(() => {
+        inflight = false;
+        if (dirty && !timer) {
+          timer = setTimeout(startWrite, WRITE_DELAY_MS);
+          timer.unref();
+        }
+      });
+  };
+
+  const wake = (): void => {
+    wakePending = false;
+    for (const w of [...waiters]) w.settle(false);
+  };
+
+  const markDirty = (): void => {
+    dirty = true;
+    if (!timer && !inflight) {
+      timer = setTimeout(startWrite, WRITE_DELAY_MS);
+      timer.unref();
+    }
+    if (waiters.size > 0 && !wakePending) {
+      wakePending = true;
+      setImmediate(wake);
+    }
+  };
+
+  /** The state every request works on: loaded once, and re-read only when another program changed the file. */
+  const current = (): State => {
+    if (!cur) {
+      cur = readState(statePath);
+      sig = sigOf(statePath);
+      return cur;
+    }
+    if (inflight) return cur;
+    let now = "";
     try {
-      const state = loadState(statePath);
+      now = sigOf(statePath);
+    } catch {
+      return cur;
+    }
+    if (now === sig) return cur;
+    if (dirty) {
+      flush();
+      return cur;
+    }
+    cur = readState(statePath);
+    sig = now;
+    return cur;
+  };
+
+  const handle: Live = { path: full, flush };
+  live.add(handle);
+  hookProcess();
+
+  const server = createServer(async (req, res) => {
+    try {
+      const raw = req.method === "POST" ? await readBody(req) : {};
+      const state = current();
       const url = new URL(req.url ?? "/", "http://x");
       const route = `${req.method} ${url.pathname}`;
       const rules = withDefaults(state.project.rules);
@@ -480,7 +668,7 @@ export function createPoolServer(statePath: string): Server {
         const now = Date.now();
         while (badJoinAttempts.length && badJoinAttempts[0] < now - 10 * 60_000) badJoinAttempts.shift();
         if (badJoinAttempts.length >= 20) return send(res, 429, { error: "Too many wrong join codes. Try again in a few minutes." });
-        const body = (await readBody(req)) as { code?: unknown; name?: unknown };
+        const body = raw as { code?: unknown; name?: unknown };
         const codeHash = typeof body.code === "string" ? sha256Hex(body.code) : "";
         const invite = codeHash ? (state.invites ?? []).find((i) => !i.usedAt && sameText(codeHash, i.codeHash)) : undefined;
         if (!invite && (typeof body.code !== "string" || state.sharedCodeOff || !sameText(body.code, state.joinCode))) {
@@ -496,7 +684,7 @@ export function createPoolServer(statePath: string): Server {
         const token = newToken();
         if (invite) invite.usedAt = new Date().toISOString();
         state.contributors.push({ name: body.name, tokenHash: sha256Hex(token), joined: new Date().toISOString(), revoked: false });
-        saveState(statePath, state);
+        markDirty();
         return send(res, 200, { token, name: body.name, project: state.project });
       }
 
@@ -521,6 +709,7 @@ export function createPoolServer(statePath: string): Server {
       if (route === "GET /status") {
         const now = Date.now();
         const counts = { open: 0, claimed: 0, done: 0 };
+        const idx = buildIndex(state);
         for (const t of state.tasks) counts[isExpired(t, now) ? "open" : t.state]++;
         const count = (s: NoteStatus) => state.proposals.filter((p) => p.status === s).length;
         return send(res, 200, {
@@ -531,8 +720,8 @@ export function createPoolServer(statePath: string): Server {
           rejected: count("rejected"),
           yourProposals: state.proposals.filter((p) => p.author === me.name).length,
           finished: isFinishedFor(state, me.name),
-          graph: graphStats(state),
-          stale: staleNotes(state).length,
+          graph: graphStats(state, idx),
+          stale: staleNotes(state, idx).length,
           known: state.tasks.filter((t) => t.known).length,
           invitesPending: (state.invites ?? []).filter((i) => !i.usedAt).length,
         });
@@ -541,49 +730,77 @@ export function createPoolServer(statePath: string): Server {
       if (route === "GET /activity") return send(res, 200, buildActivity(state, Date.now(), me.name));
 
       if (route === "POST /claim") {
-        const claimBody = (await readBody(req)) as { slot?: unknown; model?: unknown } | null;
+        const claimBody = raw as { slot?: unknown; model?: unknown; wait?: unknown } | null;
         const slot = claimBody?.slot ?? 0;
         if (typeof slot !== "number" || !Number.isInteger(slot) || slot < 0 || slot >= rules.maxParallel) {
           return send(res, 400, { error: `slot must be a whole number from 0 to ${rules.maxParallel - 1}.` });
         }
         const model = typeof claimBody?.model === "string" && MODEL_RE.test(claimBody.model) ? claimBody.model : undefined;
-        if (model) me.model = model;
-        const task = claimTask(state, me.name, Date.now(), slot, model ?? me.model);
-        saveState(statePath, state);
-        const proposal = task && kindOf(task) === "review" ? proposalOf(state, task) : undefined;
-        return send(res, 200, {
-          task,
-          // What the reviewer is asked to check. It is other people's text, so the reviewer treats it as data, never as instructions.
-          proposal: proposal ? { notes: proposalNotes(state, proposal.id).map((n) => ({ kind: n.kind, value: n.value })), alternatives: proposal.alternatives ?? [] } : undefined,
-          callees: task ? calleeContext(state, task.address) : [],
-          callers: task ? callerContext(state, task.address) : [],
-          // Other people's text again: the worker treats it as data. Only for functions being analyzed.
-          handoff: task && kindOf(task) === "analyze" ? (task.handoff ?? []) : [],
-          twins: task && kindOf(task) === "analyze" ? twinHints(state, task) : [],
-          finished: task ? false : isFinishedFor(state, me.name),
+        const waitS = typeof claimBody?.wait === "number" && Number.isFinite(claimBody.wait) ? Math.min(MAX_WAIT_S, Math.max(0, Math.floor(claimBody.wait))) : 0;
+        const name = me.name;
+        // One attempt to give this person something, on whatever the current state is.
+        const attempt = (): { task: Task | null; reply: ReturnType<typeof claimReply> } | null => {
+          const st = current();
+          const who = st.contributors.find((c) => c.name === name && !c.revoked);
+          if (!who) return null;
+          let changed = false;
+          if (model && who.model !== model) {
+            who.model = model;
+            changed = true;
+          }
+          if (sweepExpired(st) > 0) changed = true;
+          const task = claimTask(st, name, Date.now(), slot, model ?? who.model);
+          if (task || changed) markDirty();
+          return { task, reply: claimReply(st, who, task) };
+        };
+        const first = attempt();
+        if (!first) return send(res, 401, { error: "Not recognized. Join again with the join code, or ask the leader." });
+        if (first.task || first.reply.finished || waitS === 0) return send(res, 200, first.reply);
+        await new Promise<void>((done) => {
+          const waiter: Waiter = {
+            settle: (final) => {
+              const r = attempt();
+              if (r && !final && !r.task && !r.reply.finished) return;
+              clearTimeout(t);
+              waiters.delete(waiter);
+              if (!res.destroyed && !res.writableEnded) {
+                if (r) send(res, 200, r.reply);
+                else send(res, 401, { error: "Not recognized. Join again with the join code, or ask the leader." });
+              }
+              done();
+            },
+          };
+          const t = setTimeout(() => waiter.settle(true), waitS * 1000);
+          waiters.add(waiter);
+          res.on("close", () => {
+            clearTimeout(t);
+            waiters.delete(waiter);
+            done();
+          });
         });
+        return;
       }
 
       if (route === "POST /release") {
-        const body = (await readBody(req)) as { note?: unknown; taskId?: unknown };
+        const body = raw as { note?: unknown; taskId?: unknown };
         const result = releaseTasks(state, me.name, body.note, Date.now(), typeof body.taskId === "string" ? body.taskId : undefined);
-        saveState(statePath, state);
+        markDirty();
         return send(res, 200, { ok: true, ...result });
       }
 
       if (route === "POST /submit") {
-        const body = (await readBody(req)) as { taskId?: unknown; notes?: unknown; protocol?: unknown; verdict?: unknown; callees?: unknown; shape?: unknown; alternatives?: unknown };
+        const body = raw as { taskId?: unknown; notes?: unknown; protocol?: unknown; verdict?: unknown; callees?: unknown; shape?: unknown; alternatives?: unknown };
         if (body.protocol !== rules.protocol) {
           return send(res, 400, { error: `This project uses note format "${rules.protocol}" but you sent "${String(body.protocol)}". Update your pool tool.` });
         }
         const task = state.tasks.find((t) => t.id === body.taskId);
-        if (!task || task.state !== "claimed" || task.claimedBy !== me.name || isExpired(task, Date.now())) {
+        if (!task || task.state !== "claimed" || task.claimedBy !== me.name) {
           return send(res, 409, { error: "You do not hold a current claim on that task. Claim a task first." });
         }
         if (kindOf(task) === "review") {
           if (!["agree", "disagree", "unsure"].includes(body.verdict as string)) return send(res, 400, { error: 'verdict must be "agree", "disagree" or "unsure".' });
           const result = submitReview(state, me.name, task, body.verdict as Verdict);
-          saveState(statePath, state);
+          markDirty();
           return send(res, 200, { review: result });
         }
         if (!Array.isArray(body.notes) || body.notes.length === 0 || body.notes.length > 20) {
@@ -592,7 +809,7 @@ export function createPoolServer(statePath: string): Server {
         if (Array.isArray(body.callees)) addCallees(task, cleanCallees(body.callees, task.address));
         if (isShape(body.shape)) task.shape = body.shape;
         const results = submitAnalysis(state, me.name, task, body.notes as RawNote[], new Date(), cleanAlternatives(body.alternatives));
-        saveState(statePath, state);
+        markDirty();
         return send(res, 200, { results });
       }
 
@@ -602,4 +819,21 @@ export function createPoolServer(statePath: string): Server {
       return send(res, message === "too large" ? 413 : 400, { error: message });
     }
   });
+
+  // Closing answers whoever is still waiting, writes what is pending, and leaves the registry.
+  const finish = (): void => {
+    for (const w of [...waiters]) w.settle(true);
+    try {
+      flush();
+    } finally {
+      live.delete(handle);
+    }
+  };
+  const close = server.close.bind(server);
+  server.close = ((cb?: (err?: Error) => void) => {
+    finish();
+    return close(cb);
+  }) as typeof server.close;
+  server.on("close", finish);
+  return server;
 }

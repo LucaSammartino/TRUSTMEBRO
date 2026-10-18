@@ -16,6 +16,7 @@ import { readVersion } from "./check.ts";
 import { buildActivity } from "./activity.ts";
 import { renderActivity } from "./watch.ts";
 import { compareNotes, NOTE_PROTOCOL } from "./trust.ts";
+import { exportState, importState } from "./handover.ts";
 import { readJson, sha256File, writeJsonAtomic } from "./util.ts";
 
 // What contributors must have. `required` is replaced by the versions actually installed on the leader's computer.
@@ -84,7 +85,11 @@ function usage(): never {
   invite <name> | invites | uninvite <name>
                                       Personal one-use join codes (print the join line / list / cancel)
   close-shared | open-shared          Switch the shared join code off / on (personal invites keep working)
-  retry-models <label,label|none>     Model labels that get retries first (none clears)
+  export-state [file]                 Copy the whole project (default ./pool-export.json) to hand the leader job
+                                      to someone else. Contains everyone's access: give it only to someone you trust
+  import-state <file> [--force]       New leader: load an exported project into the data folder, then run start.
+                                      Everyone then runs  pool set-leader <new address>
+  retry-models <label,label|none>    Model labels that get retries first (none clears)
   tasks-from-rea <file> | add-tasks <file.json> | init <file> | serve
                                       The steps "start" does for you, if you want them separately
 
@@ -558,6 +563,31 @@ async function main() {
       }
       saveState(statePath, state);
       console.log(command === "approve" ? "Marked trusted." : "Marked rejected.");
+      break;
+    }
+    case "export-state": {
+      const out = rest[0] ?? "pool-export.json";
+      const r = exportState(dataDir, out);
+      if ("error" in r) {
+        console.error(r.error);
+        process.exit(1);
+      }
+      console.log(`Saved the whole project to ${out}.`);
+      console.log("WARNING: this file contains everyone's access (their token hashes and the join code). Only give it to someone you trust.");
+      console.log(`To hand over: the new leader runs  import-state ${out}  and then  start; everyone else runs  pool set-leader <new address>.`);
+      break;
+    }
+    case "import-state": {
+      if (!rest[0]) {
+        console.error("Usage: import-state <file> [--force]");
+        process.exit(1);
+      }
+      const r = importState(rest[0], dataDir, flags.force !== undefined);
+      if ("error" in r) {
+        console.error(r.error);
+        process.exit(1);
+      }
+      console.log(`Project imported into ${dataDir}. Next: start   (then tell everyone to run  pool set-leader <your address>).`);
       break;
     }
     case "revoke": {

@@ -18,6 +18,7 @@ Windows uses `START-HERE.cmd` / `pool.cmd` / `leader.cmd`. macOS uses `START-HER
 | Watch | `pool watch`, `leader watch`, or open `http://<leader address>:8787/live` |
 | Put the results into Ghidra | `leader apply` writes `names.json` and a Ghidra script (`ApplyNames.java`); run it in Ghidra to rename functions, variables and parameters, set signatures and add structs, plus comments |
 | Invite one friend with their own code | `leader invite <name>` (single use; `leader invites`, `leader uninvite <name>`; `leader close-shared` turns the shared join line off) |
+| Hand over to another leader | `leader export-state` (it holds everyone's access: give it only to someone you trust). The new leader runs `leader import-state <file>` then `leader start`; everyone runs `pool set-leader <new address>` |
 | Send retries to stronger models | `leader retry-models <label,label>` (`none` clears it). It is only a preference, nothing gets stuck |
 | See progress / results | `leader status`, `leader export results.json --best` |
 | Read the whole program once (fast) | `pool prepare` (friends) or `leader prepare <program file>`: one Ghidra session, about a minute, cached on your own computer. `pool run` and `leader graph` do it automatically if you forget |
@@ -55,7 +56,8 @@ Checking comes before new work and nobody does the same function twice. Every no
 - **No duplicate names:** two functions cannot take the same name. The AI may add up to three alternative names, which are kept for the export.
 - **Give-ups cool down** at the back of the queue (`releaseCooldownMinutes`, default 15), and leave a hand-off note for the next worker. Expired leases count as give-ups.
 - **Copies:** functions with the same structure are fingerprinted; once one has a trusted name, the others get it as a hint, never as an answer.
-- **Network blips:** `pool run` waits and retries for about ten minutes.
+- **Network blips:** `pool run` waits and retries for about ten minutes. A result finished while the leader is unreachable is saved on your computer and sent when it is back; a late result is accepted if nobody else took the function over.
+- **Fast leader:** the leader keeps its state in memory and saves it a moment after changes, and waiting workers are woken the moment work appears instead of checking every 30 seconds.
 
 ## Limits
 
@@ -67,4 +69,4 @@ Checking comes before new work and nobody does the same function twice. Every no
 
 ## Files
 
-`src/leader.ts`, `src/cli.ts` (the two tools), `src/server.ts` (rules and web server), `src/trust.ts` (voting), `src/graph.ts` (call graph, stale names), `src/similar.ts` (copies), `src/agent.ts` (rea and the AI), `src/mcp.ts` (MCP server), `src/activity.ts` and `src/live.ts` (live view), `src/apply.ts` and `ghidra/ApplyNames.java` (put results into Ghidra), `src/rules.ts` (note safety), `src/check.ts` (setup checks), `skill/SKILL.md` (agent instructions), `test/`. Run the tests with `npm test`.
+`src/leader.ts`, `src/cli.ts` (the two tools), `src/server.ts` (rules and web server), `src/trust.ts` (voting), `src/graph.ts` (call graph, stale names), `src/similar.ts` (copies), `src/agent.ts` (rea and the AI), `src/mcp.ts` (MCP server), `src/handover.ts` (offline outbox and leader hand-over), `src/activity.ts` and `src/live.ts` (live view), `src/apply.ts` and `ghidra/ApplyNames.java` (put results into Ghidra), `src/rules.ts` (note safety), `src/check.ts` (setup checks), `skill/SKILL.md` (agent instructions), `test/`. Run the tests with `npm test`.

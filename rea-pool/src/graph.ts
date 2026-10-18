@@ -42,15 +42,80 @@ export function calleesFromReaFunction(result: unknown, self: string): string[] 
 
 type Resolution = "resolved" | "unresolved";
 
-function analysisTaskAt(state: State, address: string): Task | undefined {
+/** What is known about the copies of one shape, computed on first use (see similar.ts). */
+export interface ShapeInfo {
+  /** The first few copies (in task order) that have a trusted name. */
+  named: { task: Task; address: string; name: string }[];
+  /** How many copies are not done. */
+  notDone: number;
+  /** The copies themselves. */
+  members: Set<Task>;
+}
+
+/**
+ * Lookup tables over the whole state, built in one pass. A snapshot: build it once per operation that loops over
+ * many tasks and pass it to the helpers, so each lookup is O(1) instead of a scan over every task and note.
+ */
+export interface Index {
+  /** Normalized address -> first analysis task there. */
+  byAddress: Map<string, Task>;
+  /** Task id -> best trusted function_name value among its notes. */
+  trusted: Map<string, string>;
+  /** Address -> analysis tasks that call it, in task order. */
+  callers: Map<string, Task[]>;
+  /** Shape -> analysis tasks of that shape, in task order. */
+  shapes: Map<string, Task[]>;
+  /** Ids of tasks that have a trusted proposal. */
+  trustedProposalTasks: Set<string>;
+  /** Per-shape summary, filled in lazily by similar.ts. */
+  shapeInfo: Map<string, ShapeInfo>;
+}
+
+export function buildIndex(state: State): Index {
+  const byAddress = new Map<string, Task>();
+  const callers = new Map<string, Task[]>();
+  const shapes = new Map<string, Task[]>();
+  for (const t of state.tasks) {
+    if ((t.kind ?? "analyze") !== "analyze") continue;
+    const address = normalizeAddress(t.address);
+    if (address !== null && !byAddress.has(address)) byAddress.set(address, t);
+    if (t.callees) {
+      for (const callee of new Set(t.callees)) {
+        const list = callers.get(callee);
+        if (list) list.push(t);
+        else callers.set(callee, [t]);
+      }
+    }
+    if (t.shape) {
+      const list = shapes.get(t.shape);
+      if (list) list.push(t);
+      else shapes.set(t.shape, [t]);
+    }
+  }
+  const best = new Map<string, Note>();
+  for (const n of state.notes) {
+    if (n.kind !== "function_name" || n.status !== "trusted") continue;
+    const cur = best.get(n.taskId);
+    if (!cur || compareNotes(n, cur) < 0) best.set(n.taskId, n);
+  }
+  const trusted = new Map<string, string>();
+  for (const [id, n] of best) trusted.set(id, n.value);
+  const trustedProposalTasks = new Set<string>();
+  for (const p of state.proposals) if (p.status === "trusted") trustedProposalTasks.add(p.taskId);
+  return { byAddress, trusted, callers, shapes, trustedProposalTasks, shapeInfo: new Map() };
+}
+
+function analysisTaskAt(state: State, address: string, idx?: Index): Task | undefined {
+  if (idx) return idx.byAddress.get(address);
   return state.tasks.find((t) => (t.kind ?? "analyze") === "analyze" && normalizeAddress(t.address) === address);
 }
 
 /** The best trusted name the pool has for the function at this address, if any. */
-export function trustedName(state: State, address: string): string | undefined {
-  const task = analysisTaskAt(state, address);
+export function trustedName(state: State, address: string, idx?: Index): string | undefined {
+  const task = analysisTaskAt(state, address, idx);
   if (!task) return undefined;
   if (task.known) return task.known.name;
+  if (idx) return idx.trusted.get(task.id);
   const winners = state.notes.filter((n) => n.taskId === task.id && n.kind === "function_name" && n.status === "trusted").sort(compareNotes);
   return winners[0]?.value;
 }
@@ -59,10 +124,10 @@ export function trustedName(state: State, address: string): string | undefined {
  * Is this callee still worth waiting for? It is resolved when it has a trusted name, when its work is finished
  * (nothing more will come of it), or when it is not one of our functions (imports, unknown targets).
  */
-function resolution(state: State, address: string): Resolution {
-  const task = analysisTaskAt(state, address);
+function resolution(state: State, address: string, idx?: Index): Resolution {
+  const task = analysisTaskAt(state, address, idx);
   if (!task || task.state === "done") return "resolved";
-  return trustedName(state, address) ? "resolved" : "unresolved";
+  return trustedName(state, address, idx) ? "resolved" : "unresolved";
 }
 
 /**
@@ -71,9 +136,10 @@ function resolution(state: State, address: string): Resolution {
  *   1        callees are not known yet; we cannot tell
  *   1 + n    callees are known and n of them are still unresolved
  */
-export function readiness(state: State, task: Task): number {
+export function readiness(state: State, task: Task, idx?: Index): number {
   if (!task.callees) return 1;
-  const open = task.callees.filter((a) => resolution(state, a) === "unresolved").length;
+  const index = idx ?? buildIndex(state);
+  const open = task.callees.filter((a) => resolution(state, a, index) === "unresolved").length;
   return open === 0 ? 0 : 1 + open;
 }
 
@@ -83,12 +149,13 @@ export interface CalleeInfo {
 }
 
 /** The callee names a worker may be shown: only names that were trusted, never guesses that are still being checked. */
-export function calleeContext(state: State, address: string): CalleeInfo[] {
-  const task = analysisTaskAt(state, normalizeAddress(address) ?? "");
+export function calleeContext(state: State, address: string, idx?: Index): CalleeInfo[] {
+  const index = idx ?? buildIndex(state);
+  const task = analysisTaskAt(state, normalizeAddress(address) ?? "", index);
   if (!task?.callees) return [];
   const out: CalleeInfo[] = [];
   for (const callee of task.callees) {
-    const name = trustedName(state, callee);
+    const name = trustedName(state, callee, index);
     if (name) out.push({ address: callee, name });
     if (out.length >= MAX_CONTEXT) break;
   }
@@ -96,13 +163,13 @@ export function calleeContext(state: State, address: string): CalleeInfo[] {
 }
 
 /** The functions that call this one and already have a trusted or known name (at most 30). Same shape as calleeContext. */
-export function callerContext(state: State, address: string): CalleeInfo[] {
+export function callerContext(state: State, address: string, idx?: Index): CalleeInfo[] {
   const me = normalizeAddress(address);
   if (!me) return [];
+  const index = idx ?? buildIndex(state);
   const out: CalleeInfo[] = [];
-  for (const t of state.tasks) {
-    if ((t.kind ?? "analyze") !== "analyze" || !t.callees?.includes(me)) continue;
-    const name = trustedName(state, t.address);
+  for (const t of index.callers.get(me) ?? []) {
+    const name = trustedName(state, t.address, index);
     if (name) out.push({ address: normalizeAddress(t.address) ?? t.address, name });
     if (out.length >= MAX_CONTEXT) break;
   }
@@ -110,10 +177,11 @@ export function callerContext(state: State, address: string): CalleeInfo[] {
 }
 
 /** Pure: should this finished function get one more pass now that its callers are named? */
-export function needsRefinement(state: State, task: Task): boolean {
+export function needsRefinement(state: State, task: Task, idx?: Index): boolean {
   if ((task.kind ?? "analyze") !== "analyze" || task.state !== "done" || task.known || task.refined) return false;
-  if (state.proposals.some((p) => p.taskId === task.id && p.status === "trusted")) return false;
-  return callerContext(state, task.address).length > 0;
+  const index = idx ?? buildIndex(state);
+  if (index.trustedProposalTasks.has(task.id)) return false;
+  return callerContext(state, task.address, index).length > 0;
 }
 
 /** The same list as text lines, for notes: which callee names this answer was built on. */
@@ -122,13 +190,14 @@ export function basedOn(context: CalleeInfo[]): string[] {
 }
 
 /** Trusted notes built on a callee name that is no longer the trusted one (changed, or no trusted name left). Pure. */
-export function staleNotes(state: State): Note[] {
+export function staleNotes(state: State, idx?: Index): Note[] {
+  const index = idx ?? buildIndex(state);
   return state.notes.filter((n) => {
     if (n.status !== "trusted" || !n.basedOn || n.basedOn.length === 0) return false;
     return n.basedOn.some((entry) => {
       const i = entry.indexOf("=");
       if (i < 0) return false;
-      return trustedName(state, entry.slice(0, i)) !== entry.slice(i + 1);
+      return trustedName(state, entry.slice(0, i), index) !== entry.slice(i + 1);
     });
   });
 }
@@ -148,13 +217,14 @@ export interface GraphStats {
   ready: number;
 }
 
-export function graphStats(state: State): GraphStats {
+export function graphStats(state: State, idx?: Index): GraphStats {
+  const index = idx ?? buildIndex(state);
   const analysis = state.tasks.filter((t) => (t.kind ?? "analyze") === "analyze");
   const known = analysis.filter((t) => t.callees);
   return {
     known: known.length,
     unknown: analysis.length - known.length,
     edges: known.reduce((sum, t) => sum + (t.callees?.length ?? 0), 0),
-    ready: known.filter((t) => readiness(state, t) === 0).length,
+    ready: known.filter((t) => readiness(state, t, index) === 0).length,
   };
 }

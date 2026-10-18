@@ -15,6 +15,7 @@ import type { Activity } from "./activity.ts";
 import { renderActivity } from "./watch.ts";
 import { runMcpServer } from "./mcp.ts";
 import { loadDump, prepareTarget } from "./prepare.ts";
+import { appendOutbox, flushOutbox, readOutbox, validLeaderUrl } from "./handover.ts";
 
 interface Config {
   leaderUrl: string;
@@ -74,6 +75,59 @@ async function api<T>(config: Config, method: string, path: string, body?: unkno
     process.exit(1);
   }
   return data;
+}
+
+const OUTBOX_PATH = process.env.REA_POOL_OUTBOX ?? CONFIG_PATH + ".outbox.json";
+
+type TryReply<T> = { ok: boolean; offline?: boolean; data: T & { error?: string } };
+
+/** Like api, but never exits: an unreachable leader (no connection, timeout, 5xx) comes back as {offline:true}. */
+async function tryApi<T>(config: Config, method: string, path: string, body?: unknown, timeoutMs = 30_000): Promise<TryReply<T>> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(config.leaderUrl.replace(/\/$/, "") + path, {
+        method,
+        headers: { authorization: `Bearer ${config.token}`, "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const data = (await res.json().catch(() => ({}))) as T & { error?: string };
+      return res.status >= 500 ? { ok: false, offline: true, data } : { ok: res.ok, data };
+    } catch (err) {
+      // A stale kept-alive connection fails at once: try one fresh one. A timeout is not retried.
+      if (err instanceof Error && err.name === "TimeoutError") break;
+    }
+  }
+  return { ok: false, offline: true, data: {} as T & { error?: string } };
+}
+
+/** Send a finished result; if the leader cannot be reached, keep it in the outbox instead of losing it. */
+async function submitOrQueue<T>(config: Config, body: unknown): Promise<{ status: "sent"; data: T } | { status: "queued" } | { status: "refused"; error: string }> {
+  const r = await tryApi<T>(config, "POST", "/submit", body);
+  if (r.ok) return { status: "sent", data: r.data };
+  if (!r.offline) return { status: "refused", error: r.data.error ?? "the leader did not accept it" };
+  appendOutbox(OUTBOX_PATH, body);
+  console.error("Cannot reach the leader. Your result is saved on this computer and will be sent when it is back.");
+  return { status: "queued" };
+}
+
+/** Try to send everything in the outbox (in order). */
+let flushing: Promise<void> | undefined;
+function flushQueue(config: Config): Promise<void> {
+  flushing ??= (async () => {
+    try {
+      if (readOutbox(OUTBOX_PATH).length === 0) return;
+      const r = await flushOutbox(OUTBOX_PATH, async (body) => {
+        const res = await tryApi(config, "POST", "/submit", body);
+        return res.ok ? "sent" : res.offline ? "offline" : "refused";
+      });
+      if (r.sent) console.log(`Sent ${r.sent} saved result(s) to the leader.`);
+      if (r.refused) console.log(`${r.refused} saved result(s) were no longer wanted by the leader and were dropped.`);
+    } finally {
+      flushing = undefined;
+    }
+  })();
+  return flushing;
 }
 
 function parseArgs(argv: string[]) {
@@ -151,16 +205,44 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
   // Shared by all loops: 5 failures in a row overall stop everything.
   let failures = 0;
   let done = 0;
+  // Patience for an unreachable leader (about ten minutes), counted across claims and submissions of all slots.
+  let offlineSince: number | undefined;
+  let gaveUp = false;
+  const online = () => void (offlineSince = undefined);
+  const offline = (): boolean => {
+    offlineSince ??= Date.now();
+    if (Date.now() - offlineSince > 10 * 60_000) gaveUp = true;
+    return gaveUp;
+  };
+  await flushQueue(config);
   const worker = async (slot: number): Promise<void> => {
     const say = (text: string) => console.log(parallel > 1 ? `[${slot}] ${text}` : text);
     let waiting = false;
-    while (true) {
-      const claim = await api<ClaimReply>(config, "POST", "/claim", { slot, model });
+    let unreachable = false;
+    while (!gaveUp) {
+      await flushQueue(config);
+      const began = Date.now();
+      const reply = await tryApi<ClaimReply>(config, "POST", "/claim", { slot, model, wait: 25 }, 60_000);
+      if (reply.offline) {
+        if (offline()) return;
+        if (!unreachable) say("Cannot reach the leader; trying again every 15 seconds...");
+        unreachable = true;
+        await sleep(15_000);
+        continue;
+      }
+      if (!reply.ok) {
+        console.error(`The leader said: ${reply.data.error ?? "something went wrong"}`);
+        process.exit(1);
+      }
+      online();
+      unreachable = false;
+      const claim = reply.data;
       if (!claim.task) {
         if (claim.finished) return;
-        if (!waiting) say("Waiting for other contributors to finish (checking again every 30 seconds)...");
+        if (!waiting) say("Waiting for other contributors to finish...");
         waiting = true;
-        await sleep(30_000);
+        // The leader holds the answer until work appears; if it answered at once anyway (older leader), pause briefly.
+        await sleep(Math.max(0, 10_000 - (Date.now() - began)));
         continue;
       }
       waiting = false;
@@ -171,19 +253,26 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
         let outcome: string;
         if (isReview) {
           const verdict = await reviewAsync(ctx, task.address, claim.proposal?.notes ?? [], claim.callees ?? [], claim.callers ?? []);
-          await api(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, verdict });
-          outcome = `you said: ${verdict}`;
+          const sub = await submitOrQueue(config, { protocol: NOTE_PROTOCOL, taskId: task.id, verdict });
+          if (sub.status === "queued") offline();
+          else online();
+          outcome = sub.status === "queued" ? `you said: ${verdict} (saved, will be sent later)` : sub.status === "refused" ? `not accepted (${sub.error})` : `you said: ${verdict}`;
         } else {
           const { notes, callees, shape, alternatives } = await analyzeAsync(ctx, task.address, claim.callees ?? [], { handoff: claim.handoff, twins: claim.twins }, claim.callers ?? []);
-          const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });
-          outcome = describe(results.find((r) => r.status !== "rejected")?.status ?? "rejected", results.find((r) => r.status === "rejected")?.reason);
+          const sub = await submitOrQueue<{ results: { status: NoteStatus; reason?: string }[] }>(config, { protocol: NOTE_PROTOCOL, taskId: task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });
+          if (sub.status === "queued") offline();
+          else online();
+          if (sub.status === "sent") {
+            const { results } = sub.data;
+            outcome = describe(results.find((r) => r.status !== "rejected")?.status ?? "rejected", results.find((r) => r.status === "rejected")?.reason);
+          } else outcome = sub.status === "queued" ? "done (saved, will be sent when the leader is back)" : `not accepted (${sub.error})`;
         }
         say(start + outcome);
         failures = 0;
         done++;
       } catch (err) {
         say(`${start}failed: ${err instanceof Error ? err.message : err}`);
-        await api(config, "POST", "/release", { taskId: task.id, note: failureNote(err) });
+        await tryApi(config, "POST", "/release", { taskId: task.id, note: failureNote(err) });
         if (++failures >= 5) {
           console.error("\nToo many failures in a row, stopping. Fix the problem above and run again.");
           process.exit(1);
@@ -194,6 +283,12 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
     }
   };
   await Promise.all(Array.from({ length: parallel }, (_, slot) => worker(slot)));
+  const saved = readOutbox(OUTBOX_PATH).length;
+  if (saved > 0) console.log(`\n${saved} result(s) are saved and will be sent next time you run pool run.`);
+  if (gaveUp) {
+    console.error("\nCould not reach the leader for about ten minutes, stopping.");
+    process.exit(1);
+  }
   if (!flags.once) console.log(`\nNothing left to do. You finished ${done} task(s). Thank you!`);
 }
 
@@ -295,6 +390,18 @@ async function main() {
       console.log("Saved. Run: pool check");
       break;
     }
+    case "set-leader": {
+      const config = loadConfig();
+      const url = validLeaderUrl(rest[0]);
+      if (!url) {
+        console.error("Give the new leader's address, e.g. pool set-leader http://100.64.0.5:8787");
+        process.exit(1);
+      }
+      config.leaderUrl = url;
+      saveConfig(config);
+      console.log(`Now using ${url}`);
+      break;
+    }
     case "check": {
       const config = loadConfig();
       const { project } = await api<{ project: Project }>(config, "GET", "/project");
@@ -379,8 +486,13 @@ async function main() {
       const common = { confidence: level, model: flags.model ?? config.model ?? "unknown", agent: "rea-pool-skill", evidence: ["decompiled by Ghidra via rea"] };
       const notes = [{ kind: "function_name", value: name, ...common }, { kind: "comment", value: summary, ...common }, ...detailsFromFlags(flags).map((d) => ({ ...d, ...common }))];
       const alternatives = flags.alt && flags.alt !== "true" ? cleanAlternatives(flags.alt.split(","), name) : [];
-      const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });
-      console.log(describe(results.find((r) => r.status !== "rejected")?.status ?? "rejected", results.find((r) => r.status === "rejected")?.reason));
+      const sub = await submitOrQueue<{ results: { status: NoteStatus; reason?: string }[] }>(config, { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });
+      if (sub.status === "refused") {
+        console.error(`The leader said: ${sub.error}`);
+        process.exit(1);
+      }
+      if (sub.status === "queued") console.log("Saved; it will be sent the next time you run pool run.");
+      else console.log(describe(sub.data.results.find((r) => r.status !== "rejected")?.status ?? "rejected", sub.data.results.find((r) => r.status === "rejected")?.reason));
       break;
     }
     case "verdict": {
@@ -395,8 +507,12 @@ async function main() {
         console.error("Your current task is not a check. Run: pool next");
         process.exit(1);
       }
-      await api(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, verdict });
-      console.log(`Recorded: ${verdict}`);
+      const sub = await submitOrQueue(config, { protocol: NOTE_PROTOCOL, taskId: claim.task.id, verdict });
+      if (sub.status === "refused") {
+        console.error(`The leader said: ${sub.error}`);
+        process.exit(1);
+      }
+      console.log(sub.status === "queued" ? `Saved: ${verdict}; it will be sent the next time you run pool run.` : `Recorded: ${verdict}`);
       break;
     }
     case "connect": {
@@ -420,6 +536,7 @@ async function main() {
   check                                        Check your setup matches the project
   status                                       See progress
   set-target <path>                            Change where your copy of the software is
+  set-leader <address>                         Use a new leader address (same project, e.g. after a hand-over)
   release --note "<what you tried>"            Give your current task back
   connect                                      Install the skill so an AI agent can work in the pool by itself
   mcp                                          Run as an MCP server over stdin/stdout (for AI tools)
