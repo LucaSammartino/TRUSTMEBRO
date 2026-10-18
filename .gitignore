@@ -8,9 +8,14 @@ pool-data/
 .rea-pool.json
 *.local.json
 
-# Test scratch and downloads
+# Experiments and test scratch: results, benchmarks and graph runs never go in the repo
+experiments/
+rea-pool/examples/
 twouser/
 bench/
+**/graph.json
+**/bench-*/
+**/results*.json
 *.zip
 *.tmp
 *.log

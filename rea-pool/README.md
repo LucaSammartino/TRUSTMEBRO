@@ -108,6 +108,6 @@ The leader can also read the whole graph up front with `leader graph <software f
 
 ## Files
 
-`src/leader.ts` (leader tool), `src/cli.ts` (contributor tool), `src/server.ts` (the rules of the pool and the web server), `src/trust.ts` (confidence and voting rules), `src/agent.ts` (talks to rea and the AI), `src/graph.ts` (call graph: which function calls which), `src/rules.ts` (note safety rules), `src/check.ts` (setup checks), `test/` (automated tests), `examples/` (benchmark helpers).
+`src/leader.ts` (leader tool), `src/cli.ts` (contributor tool), `src/server.ts` (the rules of the pool and the web server), `src/trust.ts` (confidence and voting rules), `src/agent.ts` (talks to rea and the AI), `src/graph.ts` (call graph: which function calls which), `src/rules.ts` (note safety rules), `src/check.ts` (setup checks), `test/` (automated tests).
 
 Run the tests with `npm test`.
