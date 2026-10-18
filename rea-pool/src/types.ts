@@ -1,0 +1,117 @@
+export interface ToolSpec {
+  name: string;
+  /** Command used to ask the tool for its version, e.g. ["java", "-version"]. Only a short allowlist is permitted. */
+  command: string[];
+  /** Regex with one capture group that pulls the version out of the command output. */
+  versionRegex: string;
+  required: string;
+  match: "exact" | "prefix";
+}
+
+export type Confidence = "low" | "medium" | "high";
+
+export interface Rules {
+  allowedKinds: string[];
+  maxTextLength: number;
+  maxEvidenceItems: number;
+  leaseMinutes: number;
+  /** Note format version. Submissions using a different one are refused. */
+  protocol?: string;
+  /** How many times a function may be re-analyzed by different people before giving up. */
+  maxAttempts?: number;
+  /** Most votes one proposal may collect before it is left as an unverified hint. */
+  maxVotes?: number;
+  maxContributors?: number;
+}
+
+export interface Project {
+  schema: "rea-pool/1";
+  name: string;
+  created: string;
+  target: { filename: string; sha256: string; size: number };
+  tools: ToolSpec[];
+  rules: Rules;
+}
+
+export type TaskKind = "analyze" | "review";
+
+export interface Task {
+  id: string;
+  /** Missing means "analyze". */
+  kind?: TaskKind;
+  label: string;
+  address: string;
+  size?: number;
+  state: "open" | "claimed" | "done";
+  claimedBy?: string;
+  leaseUntil?: string;
+  /** Everyone who has already done this task. They are never given it again. */
+  doneBy?: string[];
+  /** For review tasks: the proposal to check. */
+  proposalId?: string;
+  /** For analyze tasks: which attempt this is (starts at 1). */
+  attempts?: number;
+}
+
+/**
+ * trusted  = high confidence, or an independent AI agreed
+ * pending  = medium confidence, waiting for an independent check
+ * hint     = low confidence or unresolved: shown, never trusted
+ * rejected = broke a safety rule, or checkers disagreed with it
+ */
+export type NoteStatus = "trusted" | "pending" | "hint" | "rejected";
+
+export interface Note {
+  id: string;
+  taskId: string;
+  proposalId?: string;
+  author: string;
+  kind: string;
+  value: string;
+  evidence: string[];
+  confidence: Confidence;
+  /** Which AI model the contributor says wrote this. Informational only, never used to decide trust. */
+  model: string;
+  agent?: string;
+  at: string;
+  status: NoteStatus;
+  reason?: string;
+  /** How many independent checkers agreed. */
+  agrees?: number;
+}
+
+export type Verdict = "agree" | "disagree" | "unsure";
+
+export interface Vote {
+  by: string;
+  verdict: Verdict;
+  at: string;
+}
+
+/** The notes one contributor sent for one task, checked together as a unit. */
+export interface Proposal {
+  id: string;
+  taskId: string;
+  author: string;
+  confidence: Confidence;
+  status: NoteStatus;
+  votes: Vote[];
+  at: string;
+}
+
+export interface Contributor {
+  name: string;
+  tokenHash: string;
+  joined: string;
+  revoked: boolean;
+}
+
+export interface State {
+  project: Project;
+  /** The shared code friends use to join. */
+  joinCode: string;
+  contributors: Contributor[];
+  tasks: Task[];
+  notes: Note[];
+  proposals: Proposal[];
+}

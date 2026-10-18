@@ -1,0 +1,5 @@
+[
+  { "id": "fn-0x401000", "label": "Function at 0x401000", "address": "0x401000", "size": 120 },
+  { "id": "fn-0x401080", "label": "Function at 0x401080", "address": "0x401080", "size": 340 },
+  { "id": "fn-0x4011f0", "label": "Function at 0x4011f0", "address": "0x4011f0", "size": 64 }
+]

@@ -1,0 +1,97 @@
+# rea-pool
+
+Lets a group of people point their own AI at the **same piece of software** and pool the results. Nobody uploads the software or any code. Everyone already has their own copy; only small notes ("this function is called `parse_packet` and it does X") travel over the internet.
+
+There is **one leader** (who sets it up once) and any number of **contributors** (who just run one command and leave it going). Nobody reviews anything by hand: the AIs check each other.
+
+> Status: version 0.2. The pool logic is tested (21 automated tests). rea + Ghidra analysis works on Windows programs. The step where it calls the Claude command line has **not been run end to end** (the login had expired during development), and it has not been tried between two real computers.
+
+## Easy install for friends (Windows)
+
+1. Get this folder (zip or copy) and put it anywhere.
+2. **Double-click `START-HERE.cmd`.**
+
+That is all. It checks each thing you need, **asks before installing anything that is missing**, and then walks you through joining. It needs about 3 GB of free disk space and an internet connection the first time.
+
+What it checks and installs:
+
+| Thing | Why | How |
+|---|---|---|
+| Node.js 24+ | runs this tool | Windows' installer (winget) |
+| Java 21 (JDK) | Ghidra needs it; your other Java versions are untouched | winget |
+| Ghidra 12.1.4 (about 570 MB) | reads the software | downloaded from the official GitHub page, **verified against its published fingerprint**, unpacked into `C:\Users\<you>\rea-pool-tools` |
+| rea 6.7.0 | lets an AI read the software | npm |
+| An AI | does the thinking | **not installed for you**: install the Claude command line from <https://claude.com/download>, run `claude auth login` in a normal window once, then run START-HERE again |
+
+It also sets three settings for your Windows user (`JAVA_HOME`, `GHIDRA_INSTALL_DIR`, `REA_ANALYSIS_PROVIDER`). If something goes wrong it says exactly what, and running it again continues where it left off. When it asks, paste the "pool join" line your friend sent you and drag the software file into the window. Leave the window open and walk away; run START-HERE again any time to continue.
+
+Everyone also needs their own copy of the software (the exact same file; it is checked by fingerprint). Currently only Windows programs (`.exe`/`.dll`, 64-bit) are supported, because that is what rea's Windows Ghidra mode supports.
+
+Other AIs work too if you pass a command: `pool run --ai "<command that reads a prompt on stdin and prints an answer>"`.
+
+Tested so far: the check-and-report logic, the Ghidra unpacking, and the launcher. **Not tested on a clean computer**: the actual winget installs. If one fails, the script says where to download that piece by hand.
+
+## Leader: set it up (once)
+
+First double-click `SETUP-ONLY.cmd` (same checks and installs as above, without joining anything). Then, in a terminal in this folder:
+
+```
+leader.cmd start <your copy of the software> --name "My project"
+```
+
+That one command fingerprints the software, records the tool versions **you** have installed as the requirements, asks rea for every function (one task each), and starts the server. It then prints a line to send to friends:
+
+```
+pool join http://<your-address>:8787 jc_xxxxxxxx --target <path to their copy>
+```
+
+The same code works for everyone, so you do not create invites one by one. Run `start` again later to resume. `status` shows progress; `export results.json --best` saves the trusted results.
+
+### Letting friends connect
+
+Friends' tools connect to **your** computer over the internet (ordinary web requests). Your computer must be reachable, and your computer must stay on while they work.
+
+1. Easiest and safest: both of you install [Tailscale](https://tailscale.com) (free), sign in, and share your computer with your friend. Your Tailscale address looks like `100.x.y.z`.
+2. Start with `leader.cmd start <file> --host 0.0.0.0` and give your friend `http://100.x.y.z:8787` as the address.
+3. Do **not** put this on the open internet as it is. Traffic is not encrypted, and anyone with the join code can join. Use `new-code` to replace the code, `revoke <name>` to remove someone.
+
+## Contributor: join and run
+
+Normally START-HERE.cmd does this for you. By hand:
+
+```
+pool.cmd join <address> <join-code> --target <your copy of the software>
+pool.cmd run
+```
+
+`join` also checks your setup. `run` then takes a task, analyzes it with rea and your AI, sends the notes, and repeats until nothing is left. Stop any time with Ctrl+C. Your current task goes back to the pool.
+
+## How results become trusted (automatically)
+
+Each function is a task. Someone's AI proposes a name and a short description with a confidence (low/medium/high). What happens next depends only on that confidence, because in our Lua test the AI's own confidence was a good guide (high: 10 of 10 right, medium: 5 of 6, low: 1 of 13):
+
+| Confidence | What happens |
+|---|---|
+| **High** | Trusted immediately. |
+| **Medium** | Another contributor's AI checks it (never the author). It agrees: trusted. It disagrees: a second checker decides. Two disagreements reject it. |
+| **Low** | Kept only as a hint. The function goes back to the pool for a different contributor to try again (up to 3 attempts). |
+
+Checking comes before new work, and nobody does the same function twice. If checkers cannot settle something it is left as an unverified hint, never trusted.
+
+Safety rules run automatically on every note: same file and tool versions required, names limited to letters/digits/underscores, no web links, no file paths, no long hex blobs, and nothing that looks like instructions to an AI. Notes that break them are rejected. Other people's notes are always treated as data by the checking AI, never as instructions.
+
+The model name a note carries is only informational (it cannot be proven), so it never affects trust.
+
+## What it does not do
+
+- It cannot prove a result is *correct*, only that it passed these checks. Treat results as strong suggestions.
+- It does not stop fake agreement between accounts one person controls. That is fine among friends; do not open it to strangers without more protection.
+- It is not encrypted and not meant for the open internet.
+- Our Lua test was easy (Lua is probably in the AI's training data); expect lower accuracy on unfamiliar software.
+- Many tasks are tiny wrapper functions where nobody can tell the purpose from the code alone; those end as hints.
+
+## Files
+
+`src/leader.ts` (leader tool), `src/cli.ts` (contributor tool), `src/server.ts` (the rules of the pool and the web server), `src/trust.ts` (confidence and voting rules), `src/agent.ts` (talks to rea and the AI), `src/rules.ts` (note safety rules), `src/check.ts` (setup checks), `test/` (automated tests), `examples/` (benchmark helpers).
+
+Run the tests with `npm test`.

@@ -1,0 +1,13 @@
+{
+  "node": { "minimumMajor": 24, "wingetId": "OpenJS.NodeJS", "wingetVersion": "24.14.1", "manualUrl": "https://nodejs.org" },
+  "java": { "major": 21, "wingetId": "EclipseAdoptium.Temurin.21.JDK", "manualUrl": "https://adoptium.net" },
+  "ghidra": {
+    "version": "12.1.4",
+    "url": "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip",
+    "sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
+    "sizeMB": 570,
+    "folderName": "ghidra_12.1.4_PUBLIC"
+  },
+  "rea": { "version": "6.7.0", "npmPackage": "rea-agents" },
+  "toolsFolder": "rea-pool-tools"
+}

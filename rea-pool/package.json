@@ -1,0 +1,13 @@
+{
+  "name": "rea-pool",
+  "version": "0.2.0",
+  "description": "Pool many people's AI agents to analyze the same software. A leader sets the rules; contributors share only small notes, never code.",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "leader": "node src/leader.ts",
+    "pool": "node src/cli.ts",
+    "test": "node --test \"test/*.test.ts\""
+  }
+}

@@ -1,0 +1,25 @@
+# Local-only research material (third-party reports have their own terms; raw notes are noise)
+reports/
+research_notes/
+
+# Runtime data that must never be published: join codes, token hashes, personal settings
+pool-data/
+**/pool-data/
+.rea-pool.json
+*.local.json
+
+# Test scratch and downloads
+twouser/
+bench/
+*.zip
+*.tmp
+*.log
+
+# Node
+node_modules/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
