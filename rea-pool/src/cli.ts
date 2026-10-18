@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { NoteStatus, Project, Task } from "./types.ts";
 import { allPassed, runAllChecks } from "./check.ts";
 import { NOTE_PROTOCOL } from "./trust.ts";
-import { cleanAlternatives } from "./rules.ts";
+import { cleanAlternatives, detailsFromFlags } from "./rules.ts";
 import { analyzeAsync, detectAi, inspectFunction, reviewAsync, type AgentContext } from "./agent.ts";
 import type { Activity } from "./activity.ts";
 import { renderActivity } from "./watch.ts";
@@ -82,7 +82,10 @@ function parseArgs(argv: string[]) {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i].startsWith("--")) {
       const next = argv[i + 1];
-      flags[argv[i].slice(2)] = next === undefined || next.startsWith("--") ? "true" : argv[++i];
+      const key = argv[i].slice(2);
+      const value = next === undefined || next.startsWith("--") ? "true" : argv[++i];
+      // A repeated flag keeps every value (joined by ), e.g. several --struct.
+      flags[key] = flags[key] !== undefined && flags[key] !== "true" && value !== "true" ? `${flags[key]}${value}` : value;
     } else positional.push(argv[i]);
   }
   return { positional, flags };
@@ -133,7 +136,7 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
     config.aiCommand = flags.ai;
     saveConfig(config);
   }
-  const ctx: AgentContext = { targetPath: config.targetPath!, aiCommand, model };
+  const ctx: AgentContext = { targetPath: config.targetPath!, aiCommand, model, allowedKinds: project.rules?.allowedKinds };
   patient = true;
   console.log(`Running as ${config.name}. Press Ctrl+C to stop; your task goes back to the pool.\n`);
 
@@ -152,7 +155,7 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
     const say = (text: string) => console.log(parallel > 1 ? `[${slot}] ${text}` : text);
     let waiting = false;
     while (true) {
-      const claim = await api<ClaimReply>(config, "POST", "/claim", { slot });
+      const claim = await api<ClaimReply>(config, "POST", "/claim", { slot, model });
       if (!claim.task) {
         if (claim.finished) return;
         if (!waiting) say("Waiting for other contributors to finish (checking again every 30 seconds)...");
@@ -333,7 +336,7 @@ async function main() {
       // For an AI agent working by hand (see the skill): print the current task with everything needed to do it.
       const config = loadConfig();
       await ensurePrepared(config, { quiet: true });
-      const claim = await api<ClaimReply>(config, "POST", "/claim");
+      const claim = await api<ClaimReply>(config, "POST", "/claim", { model: flags.model ?? config.model ?? "unknown" });
       if (!claim.task) {
         console.log(JSON.stringify({ task: null, finished: claim.finished }));
         break;
@@ -363,10 +366,10 @@ async function main() {
       const config = loadConfig();
       const { name, summary, confidence } = flags;
       if (!name || name === "true" || !summary || summary === "true") {
-        console.error('Usage: pool submit --name <snake_case_name> --summary "<one plain sentence>" --confidence low|medium|high [--alt other_name,another_name]');
+        console.error('Usage: pool submit --name <snake_case_name> --summary "<one plain sentence>" --confidence low|medium|high [--alt other_name,another_name] [--var param_1=packet,iVar2=index] [--sig "<C prototype>"] [--struct "name { type field; }"]');
         process.exit(1);
       }
-      const claim = await api<ClaimReply>(config, "POST", "/claim");
+      const claim = await api<ClaimReply>(config, "POST", "/claim", { model: flags.model ?? config.model ?? "unknown" });
       if (!claim.task || claim.task.kind === "review") {
         console.error(claim.task ? "Your current task is a check: use  pool verdict agree|disagree|unsure" : "You have no task. Run: pool next");
         process.exit(1);
@@ -374,7 +377,7 @@ async function main() {
       const { shape, callees } = inspectFunction(config.targetPath!, claim.task.address);
       const level = ["low", "medium", "high"].includes(confidence) ? confidence : "low";
       const common = { confidence: level, model: flags.model ?? config.model ?? "unknown", agent: "rea-pool-skill", evidence: ["decompiled by Ghidra via rea"] };
-      const notes = [{ kind: "function_name", value: name, ...common }, { kind: "comment", value: summary, ...common }];
+      const notes = [{ kind: "function_name", value: name, ...common }, { kind: "comment", value: summary, ...common }, ...detailsFromFlags(flags).map((d) => ({ ...d, ...common }))];
       const alternatives = flags.alt && flags.alt !== "true" ? cleanAlternatives(flags.alt.split(","), name) : [];
       const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });
       console.log(describe(results.find((r) => r.status !== "rejected")?.status ?? "rejected", results.find((r) => r.status === "rejected")?.reason));
@@ -387,7 +390,7 @@ async function main() {
         console.error("Usage: pool verdict agree|disagree|unsure");
         process.exit(1);
       }
-      const claim = await api<ClaimReply>(config, "POST", "/claim");
+      const claim = await api<ClaimReply>(config, "POST", "/claim", { model: flags.model ?? config.model ?? "unknown" });
       if (!claim.task || claim.task.kind !== "review") {
         console.error("Your current task is not a check. Run: pool next");
         process.exit(1);

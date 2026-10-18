@@ -8,7 +8,7 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { NOTE_PROTOCOL } from "./trust.ts";
-import { cleanAlternatives } from "./rules.ts";
+import { cleanAlternatives, parseExtras } from "./rules.ts";
 
 interface Config {
   leaderUrl: string;
@@ -81,6 +81,9 @@ const TOOLS = [
         summary: { type: "string", description: "One plain sentence describing what the function does" },
         confidence: { type: "string", enum: ["low", "medium", "high"] },
         alternatives: { type: "array", items: { type: "string" }, maxItems: 3, description: "Optional: up to 3 other plausible snake_case names" },
+        variables: { type: "array", items: { type: "string" }, maxItems: 10, description: 'Optional: renames of Ghidra default names, each "old=new" (e.g. "param_1=packet")' },
+        signature: { type: "string", description: "Optional: one C prototype with real parameter types" },
+        structs: { type: "array", items: { type: "string" }, maxItems: 2, description: 'Optional: "name { type field; ... }"' },
       },
       required: ["name", "summary", "confidence"],
       additionalProperties: false,
@@ -136,7 +139,7 @@ async function callTool(name: string, args: Record<string, unknown>, state: { ta
 
   switch (name) {
     case "pool_next": {
-      const claim = await api<Claim>(config, "POST", "/claim");
+      const claim = await api<Claim>(config, "POST", "/claim", { model: config.model ?? "unknown" });
       if (!claim.task) {
         state.taskId = undefined;
         return { task: null, finished: claim.finished };
@@ -157,13 +160,13 @@ async function callTool(name: string, args: Record<string, unknown>, state: { ta
     case "pool_submit": {
       const { name: fname, summary, confidence } = args;
       if (typeof fname !== "string" || !fname || typeof summary !== "string" || !summary) throw new ToolError("pool_submit needs a name and a summary (plain text).");
-      const claim = await api<Claim>(config, "POST", "/claim");
+      const claim = await api<Claim>(config, "POST", "/claim", { model: config.model ?? "unknown" });
       if (!claim.task) throw new ToolError("You have no task. Call pool_next first.");
       if (claim.task.kind === "review") throw new ToolError("Your current task is a check: use pool_verdict (agree, disagree or unsure).");
       const { shape, callees } = await runInspect(claim.task.address);
       const level = typeof confidence === "string" && ["low", "medium", "high"].includes(confidence) ? confidence : "low";
       const common = { confidence: level, model: config.model ?? "unknown", agent: "rea-pool-mcp", evidence: ["decompiled by Ghidra via rea"] };
-      const notes = [{ kind: "function_name", value: fname, ...common }, { kind: "comment", value: summary, ...common }];
+      const notes = [{ kind: "function_name", value: fname, ...common }, { kind: "comment", value: summary, ...common }, ...parseExtras(args).map((d) => ({ ...d, ...common }))];
       const alternatives = cleanAlternatives(args.alternatives, fname);
       const { results } = await api<{ results: { status: string; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });
       state.taskId = undefined;
@@ -174,7 +177,7 @@ async function callTool(name: string, args: Record<string, unknown>, state: { ta
     case "pool_verdict": {
       const verdict = args.verdict;
       if (typeof verdict !== "string" || !["agree", "disagree", "unsure"].includes(verdict)) throw new ToolError("verdict must be agree, disagree or unsure.");
-      const claim = await api<Claim>(config, "POST", "/claim");
+      const claim = await api<Claim>(config, "POST", "/claim", { model: config.model ?? "unknown" });
       if (!claim.task || claim.task.kind !== "review") throw new ToolError("Your current task is not a check. Call pool_next.");
       await api(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, verdict });
       state.taskId = undefined;

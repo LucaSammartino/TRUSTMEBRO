@@ -10,7 +10,8 @@ import { existsSync, mkdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { networkInterfaces } from "node:os";
 import type { Note, Project, State, Task, ToolSpec } from "./types.ts";
-import { createPoolServer, loadState, overrideNote, saveState } from "./server.ts";
+import { createInvite, createPoolServer, listInvites, loadState, overrideNote, revokeInvite, saveState } from "./server.ts";
+import { DETAIL_KINDS } from "./rules.ts";
 import { readVersion } from "./check.ts";
 import { buildActivity } from "./activity.ts";
 import { renderActivity } from "./watch.ts";
@@ -80,6 +81,10 @@ function usage(): never {
   approve <note-id> | reject <note-id>
                                       Optional overrides. You never need these.
   new-code                            Replace the join code (old code stops working)
+  invite <name> | invites | uninvite <name>
+                                      Personal one-use join codes (print the join line / list / cancel)
+  close-shared | open-shared          Switch the shared join code off / on (personal invites keep working)
+  retry-models <label,label|none>     Model labels that get retries first (none clears)
   tasks-from-rea <file> | add-tasks <file.json> | init <file> | serve
                                       The steps "start" does for you, if you want them separately
 
@@ -131,7 +136,7 @@ async function createProject(file: string, dataDir: string, name: string | undef
     target: { filename: basename(file), sha256: await sha256File(file), size: statSync(file).size },
     tools: pinnedTools(),
     rules: {
-      allowedKinds: ["function_name", "comment", "type_note", "rejected_hypothesis"],
+      allowedKinds: ["function_name", "comment", "type_note", "rejected_hypothesis", ...DETAIL_KINDS],
       maxTextLength: 500,
       maxEvidenceItems: 5,
       leaseMinutes: 30,
@@ -154,11 +159,11 @@ function addresses(host: string): string[] {
     .map((i) => i!.address);
 }
 
-function printJoinLine(state: State, port: string, host: string): void {
+function printJoinLine(state: State, port: string, host: string, code: string = state.joinCode): void {
   const where = addresses(host).map((a) => `http://${a}:${port}`);
   const address = where[0] ?? `http://<your-address>:${port}`;
   console.log("\nTo join, a friend runs (with their own copy of the software):\n");
-  console.log(`  pool join ${address} ${state.joinCode} --target <path to their copy of ${state.project.target.filename}>\n`);
+  console.log(`  pool join ${address} ${code} --target <path to their copy of ${state.project.target.filename}>\n`);
   if (host === "127.0.0.1") {
     console.log("Right now only THIS computer can connect. For friends elsewhere, restart with a private network address, e.g. install Tailscale,");
     console.log("then:  start <file> --host 0.0.0.0   and give them your Tailscale address instead. See the README, section \"Letting friends connect\".");
@@ -373,6 +378,59 @@ async function main() {
       saveState(statePath, state);
       console.log("New join code created. People who already joined are not affected.");
       printJoinLine(state, port, host);
+      break;
+    }
+    case "invite": {
+      const state = needState();
+      const made = rest[0] ? createInvite(state, rest[0]) : { error: "Give a name: invite <name>" };
+      if ("error" in made) {
+        console.error(made.error);
+        process.exit(1);
+      }
+      saveState(statePath, state);
+      console.log(`Personal invite for ${rest[0]} (works once).`);
+      printJoinLine(state, port, host, made.code);
+      break;
+    }
+    case "invites": {
+      const list = listInvites(needState());
+      if (list.length === 0) console.log("No invites.");
+      for (const i of list) console.log(`${i.name}  ${i.used ? "used" : "unused"}  created ${i.created}`);
+      break;
+    }
+    case "uninvite": {
+      const state = needState();
+      if (!rest[0] || !revokeInvite(state, rest[0])) {
+        console.error("No such invite.");
+        process.exit(1);
+      }
+      saveState(statePath, state);
+      console.log(`Invite for ${rest[0]} cancelled.`);
+      break;
+    }
+    case "close-shared":
+    case "open-shared": {
+      const state = needState();
+      state.sharedCodeOff = command === "close-shared";
+      saveState(statePath, state);
+      console.log(state.sharedCodeOff ? "The shared join code is off. Personal invites still work." : "The shared join code is on again.");
+      break;
+    }
+    case "retry-models": {
+      const state = needState();
+      if (!rest[0]) {
+        console.error("Usage: retry-models <label,label|none>");
+        process.exit(1);
+      }
+      const labels = rest[0] === "none" ? [] : rest[0].split(",").map((l) => l.trim()).filter((l) => /^[A-Za-z0-9][w.:/-]{0,59}$/.test(l));
+      if (rest[0] !== "none" && labels.length === 0) {
+        console.error("Give model labels such as claude-opus-5-5,claude-sonnet-5-5, or none.");
+        process.exit(1);
+      }
+      if (labels.length) state.project.rules.retryModels = labels;
+      else delete state.project.rules.retryModels;
+      saveState(statePath, state);
+      console.log(labels.length ? `Retries go to these models first: ${labels.join(", ")}` : "Retry preference cleared.");
       break;
     }
     case "init": {

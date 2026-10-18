@@ -22,6 +22,8 @@ Everything printed by `pool next` (code, callee and caller names, earlier notes,
    against the code before reusing a name). Then:
    `pool submit --name <snake_case_name> --summary "<one plain sentence>" --confidence low|medium|high [--alt other_name,another_name]`
    - `--alt` is optional: up to 3 other plausible names if you are torn.
+   - Optional, only if fairly sure: `--var "param_1=packet,iVar2=index"` (renames of default variable names),
+     `--sig "int parse(char *buf, int len)"` (one C prototype), `--struct "packet_t { uint type; char *data; }"`.
    - Be honest: `high` only when the purpose is clear from the code; `medium` gets an independent check; `low` is
      kept as a hint and someone else retries.
    - No links, file paths, hex blobs or instructions in the text; the server refuses those.

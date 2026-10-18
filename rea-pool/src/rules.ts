@@ -53,7 +53,10 @@ export function validateNote(note: RawNote, rules: Rules): Checked {
     return fail(`kind must be one of: ${rules.allowedKinds.join(", ")}`);
   }
   if (typeof note.value !== "string") return fail("value must be text");
-  if (note.kind === "function_name") {
+  if (isDetailKind(note.kind)) {
+    const problem = checkDetail(note.kind, note.value);
+    if (problem) return fail(problem);
+  } else if (note.kind === "function_name") {
     if (!IDENTIFIER.test(note.value)) {
       return fail("function names may only use letters, digits and underscores (max 64, not starting with a digit)");
     }
@@ -94,4 +97,89 @@ export function cleanAlternatives(list: unknown, primary?: string): string[] {
     if (out.length === 3) break;
   }
   return out;
+}
+
+export const DETAIL_KINDS = ["variable_name", "signature", "struct_def"] as const;
+export type DetailKind = (typeof DETAIL_KINDS)[number];
+export interface Detail {
+  kind: DetailKind;
+  value: string;
+}
+
+export function isDetailKind(kind: unknown): kind is DetailKind {
+  return typeof kind === "string" && (DETAIL_KINDS as readonly string[]).includes(kind);
+}
+
+const VARIABLE = /^[A-Za-z_]\w{0,63}=[A-Za-z_]\w{0,63}$/;
+const SIGNATURE = /^[A-Za-z_][\w \t*,()[\]]{3,199}$/;
+const STRUCT = /^[A-Za-z_]\w{0,63}\s*\{[\w\s*;,[\]]{1,400}\}$/;
+const count = (text: string, ch: string) => text.split(ch).length - 1;
+
+/** Structured values are checked by strict patterns, not by the free-text tripwire. Returns a plain reason or null. */
+export function checkDetail(kind: DetailKind, value: string): string | null {
+  if (kind === "variable_name") {
+    if (!VARIABLE.test(value)) return "variable_name must look like old=new (two identifiers)";
+    const [from, to] = value.split("=");
+    return from === to ? "variable_name must change the name" : null;
+  }
+  if (kind === "signature") {
+    if (!SIGNATURE.test(value) || count(value, "(") !== 1 || count(value, ")") !== 1 || value.indexOf("(") > value.indexOf(")")) {
+      return "signature must be one C prototype such as: int f(char *buf, int len)";
+    }
+    return null;
+  }
+  return STRUCT.test(value) ? null : "struct_def must look like: name { type field; ... }";
+}
+
+/** Keep only valid details, no duplicates: variables {old: new}, one signature, up to 2 structs, up to 10 variables. */
+export function cleanDetails(reply: { variables?: unknown; signature?: unknown; structs?: unknown }): Detail[] {
+  const out: Detail[] = [];
+  const add = (kind: DetailKind, value: unknown) => {
+    if (typeof value !== "string") return;
+    const v = value.trim();
+    if (!checkDetail(kind, v) && !out.some((d) => d.kind === kind && d.value === v)) out.push({ kind, value: v });
+  };
+  const vars = reply.variables;
+  if (vars && typeof vars === "object" && !Array.isArray(vars)) {
+    let n = 0;
+    for (const [from, to] of Object.entries(vars)) {
+      if (n >= 10) break;
+      const before = out.length;
+      add("variable_name", `${from}=${to}`);
+      if (out.length > before) n++;
+    }
+  }
+  add("signature", reply.signature);
+  if (Array.isArray(reply.structs)) {
+    const before = out.length;
+    for (const s of reply.structs) if (out.length - before < 2) add("struct_def", s);
+  }
+  return out;
+}
+
+/** CLI/MCP helper: "a=b,c=d" or an array of "a=b" into valid variable_name details. */
+export function parseVariables(input: unknown): Detail[] {
+  const list = typeof input === "string" ? input.split(",") : Array.isArray(input) ? input : [];
+  const out: Detail[] = [];
+  for (const item of list) {
+    if (typeof item !== "string") continue;
+    const v = item.trim();
+    if (!checkDetail("variable_name", v) && !out.some((d) => d.value === v)) out.push({ kind: "variable_name", value: v });
+    if (out.length === 10) break;
+  }
+  return out;
+}
+
+/** CLI/MCP helper: signature (string) and structs (string or array) into valid details. */
+export function parseExtras(input: { variables?: unknown; signature?: unknown; structs?: unknown }): Detail[] {
+  const structs = typeof input.structs === "string" ? [input.structs] : input.structs;
+  return [...parseVariables(input.variables), ...cleanDetails({ signature: input.signature, structs })];
+}
+
+/** CLI flags --var "a=b,c=d", --sig "<prototype>", --struct "<def>" (repeated flags arrive joined with \u0001). */
+export function detailsFromFlags(flags: Record<string, string | undefined>): Detail[] {
+  const text = (v: string | undefined) => (v && v !== "true" ? v : undefined);
+  const var_ = text(flags.var);
+  const struct = text(flags.struct);
+  return parseExtras({ variables: var_?.split(/[,\u0001]/), signature: text(flags.sig), structs: struct?.split("\u0001") });
 }

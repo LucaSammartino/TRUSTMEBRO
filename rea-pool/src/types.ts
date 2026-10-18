@@ -28,6 +28,8 @@ export interface Rules {
   maxReopens?: number;
   /** How many tasks one person may work on at the same time (claim slots 0..maxParallel-1). */
   maxParallel?: number;
+  /** Model labels that get second and later attempts first; everyone else takes retries only after first attempts. */
+  retryModels?: string[];
 }
 
 /** What someone who gave up on a function tells the next person: what they tried and what is still unclear. */
@@ -141,6 +143,16 @@ export interface Contributor {
   tokenHash: string;
   joined: string;
   revoked: boolean;
+  /** Model label the person last reported when claiming. Self-reported. */
+  model?: string;
+}
+
+/** A personal join code. Only its hash is stored; one invite makes one identity. */
+export interface Invite {
+  name: string;
+  codeHash: string;
+  created: string;
+  usedAt?: string;
 }
 
 export interface State {
@@ -151,4 +163,7 @@ export interface State {
   tasks: Task[];
   notes: Note[];
   proposals: Proposal[];
+  invites?: Invite[];
+  /** When true the shared join code is refused. */
+  sharedCodeOff?: boolean;
 }

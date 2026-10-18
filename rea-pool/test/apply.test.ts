@@ -66,3 +66,37 @@ test("bundle writes parseable names and copies the Ghidra script", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("variable, signature and struct notes come from trusted notes only, preferring the name's proposal, with caps", () => {
+  const s = makeState();
+  const vars = Array.from({ length: 14 }, (_, i) => note(`v${i}`, { kind: "variable_name", value: `local_${i}=count${i}`, proposalId: "p" }));
+  s.notes = [note("name", { proposalId: "p" }), ...vars,
+    note("dup", { kind: "variable_name", value: "local_0=other", proposalId: "p" }),
+    note("bad", { kind: "variable_name", value: "not valid", proposalId: "p" }),
+    note("pv", { kind: "variable_name", value: "x=y", status: "pending", agrees: 9 }),
+    note("hv", { kind: "variable_name", value: "h=i", status: "hint" }),
+    note("rv", { kind: "variable_name", value: "r=s", status: "rejected" }),
+    note("sigA", { kind: "signature", value: "int f(int a)", proposalId: "p" }),
+    note("sigB", { kind: "signature", value: "void g(void)", proposalId: "q", agrees: 5 }),
+    note("sigP", { kind: "signature", value: "void p(void)", status: "pending", agrees: 9 }),
+    note("s1", { kind: "struct_def", value: "a_t { int x; }", proposalId: "p" }),
+    note("s2", { kind: "struct_def", value: "b_t { int y; }", proposalId: "p" }),
+    note("s3", { kind: "struct_def", value: "c_t { int z; }", proposalId: "p" }),
+    note("s1b", { kind: "struct_def", value: "a_t { int x; }", proposalId: "p" })];
+  const [e] = buildApplyEntries(s);
+  assert.equal(e!.variables!.length, 10);
+  assert.deepEqual(e!.variables![0], { from: "local_0", to: "count0" });
+  assert.equal(e!.signature, "int f(int a)");
+  assert.equal(e!.structs!.length, 2);
+  assert.deepEqual(e!.structs, ["a_t { int x; }", "b_t { int y; }"]);
+});
+
+test("detail notes fall back to the best trusted ones; untrusted detail notes give the old entry shape", () => {
+  const s = makeState();
+  s.notes = [note("name", { proposalId: "p" }),
+    note("sigB", { kind: "signature", value: "void g(void)", proposalId: "q", agrees: 5 }),
+    note("sigC", { kind: "signature", value: "void c(void)", proposalId: "q" }),
+    note("pv", { kind: "variable_name", value: "x=y", status: "pending" }),
+    note("ps", { kind: "struct_def", value: "a_t { int x; }", status: "hint" })];
+  assert.deepEqual(buildApplyEntries(s), [{ address: "0xa", name: "name", signature: "void g(void)", confidence: "high", agrees: 0 }]);
+});

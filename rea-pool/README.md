@@ -16,7 +16,9 @@ Windows uses `START-HERE.cmd` / `pool.cmd` / `leader.cmd`. macOS uses `START-HER
 | Work in parallel | `pool run --parallel 3` |
 | Let an AI agent work | `pool connect`, or point your agent at the MCP server `node src/mcp.ts` |
 | Watch | `pool watch`, `leader watch`, or open `http://<leader address>:8787/live` |
-| Put the results into Ghidra | `leader apply` writes `names.json` and a Ghidra script (`ApplyNames.java`); run it in Ghidra to rename the functions and add comments |
+| Put the results into Ghidra | `leader apply` writes `names.json` and a Ghidra script (`ApplyNames.java`); run it in Ghidra to rename functions, variables and parameters, set signatures and add structs, plus comments |
+| Invite one friend with their own code | `leader invite <name>` (single use; `leader invites`, `leader uninvite <name>`; `leader close-shared` turns the shared join line off) |
+| Send retries to stronger models | `leader retry-models <label,label>` (`none` clears it). It is only a preference, nothing gets stuck |
 | See progress / results | `leader status`, `leader export results.json --best` |
 | Read the whole program once (fast) | `pool prepare` (friends) or `leader prepare <program file>`: one Ghidra session, about a minute, cached on your own computer. `pool run` and `leader graph` do it automatically if you forget |
 | Read the call graph up front | `leader graph <program file>` (uses the cache; `--no-prepare` falls back to one slow rea call per function, `--parallel 4`) |
@@ -49,6 +51,7 @@ Checking comes before new work and nobody does the same function twice. Every no
 - **Bottom-up:** functions whose callees already have trusted names go first, and those names are shown to the AI. `basedOn` records which names a note used; if one later changes, the note is marked stale and the function is reopened once.
 - **Known names are free:** functions Ghidra already named (symbols, library matches) are skipped and shown to the AI as trusted context. `leader graph --keep-named` turns this off (for testing on programs that still have symbols).
 - **Callers help too:** each function is also shown the names of the functions that call it. Functions that ended as hints get one more try once their callers are named.
+- **More than names:** besides the function name and comment, the AI may add variable names (`param_1=packet`), a signature and struct definitions when it is fairly sure. They share the name's review and are written into Ghidra by `leader apply`.
 - **No duplicate names:** two functions cannot take the same name. The AI may add up to three alternative names, which are kept for the export.
 - **Give-ups cool down** at the back of the queue (`releaseCooldownMinutes`, default 15), and leave a hand-off note for the next worker. Expired leases count as give-ups.
 - **Copies:** functions with the same structure are fingerprinted; once one has a trusted name, the others get it as a hint, never as an answer.

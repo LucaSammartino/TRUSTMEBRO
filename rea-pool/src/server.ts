@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Confidence, Note, NoteStatus, Proposal, State, Task, Verdict } from "./types.ts";
 import { checkText, IDENTIFIER, validateNote, type RawNote } from "./rules.ts";
 import { initialStatus, proposalConfidence, resolveVotes, withDefaults } from "./trust.ts";
@@ -16,7 +16,35 @@ const MAX_BODY = 64 * 1024;
 export function loadState(path: string): State {
   const state = readJson<State>(path);
   state.proposals ??= [];
+  state.invites ??= [];
+  const kinds = state.project?.rules?.allowedKinds;
+  if (Array.isArray(kinds)) for (const k of ["variable_name", "signature", "struct_def"]) if (!kinds.includes(k)) kinds.push(k);
   return state;
+}
+
+const NAME_RE = /^[\w-]{1,30}$/;
+const MODEL_RE = /^[A-Za-z0-9][\w.:/-]{0,59}$/;
+
+/** Make a personal join code for one person. The code is returned once; only its hash is kept. */
+export function createInvite(state: State, name: string): { code: string } | { error: string } {
+  if (typeof name !== "string" || !NAME_RE.test(name)) return { error: "Pick a short name using letters, digits, - or _." };
+  state.invites ??= [];
+  if (state.contributors.some((c) => c.name === name)) return { error: "That name is already a contributor." };
+  if (state.invites.some((i) => i.name === name && !i.usedAt)) return { error: "That name already has an unused invite." };
+  const code = "ji_" + randomBytes(24).toString("base64url");
+  state.invites.push({ name, codeHash: sha256Hex(code), created: new Date().toISOString() });
+  return { code };
+}
+
+/** Remove an invite nobody has used yet. */
+export function revokeInvite(state: State, name: string): boolean {
+  const before = (state.invites ??= []).length;
+  state.invites = state.invites.filter((i) => i.usedAt || i.name !== name);
+  return state.invites.length < before;
+}
+
+export function listInvites(state: State): { name: string; created: string; used: boolean }[] {
+  return (state.invites ?? []).map((i) => ({ name: i.name, created: i.created, used: !!i.usedAt }));
 }
 
 export function saveState(path: string, state: State): void {
@@ -61,8 +89,9 @@ function isCooling(task: Task, now: number, cooldownMs: number): boolean {
 }
 
 /** Lower sorts first: not cooling, callees most ready, given up on least, then the one with the most unnamed copies. */
-function queueKey(state: State, task: Task, now: number, cooldownMs: number): number[] {
-  return [isCooling(task, now, cooldownMs) ? 1 : 0, readiness(state, task), task.abandons ?? 0, -twinPotential(state, task)];
+function queueKey(state: State, task: Task, now: number, cooldownMs: number, strong = false, tiered = false): number[] {
+  const retry = (task.attempts ?? 1) > 1;
+  return [tiered ? (retry === strong ? 0 : 1) : 0, isCooling(task, now, cooldownMs) ? 1 : 0, readiness(state, task), task.abandons ?? 0, -twinPotential(state, task)];
 }
 
 function keyBefore(a: number[], b: number[]): boolean {
@@ -71,13 +100,16 @@ function keyBefore(a: number[], b: number[]): boolean {
 }
 
 /** Of the analysis tasks someone can take, the best by queueKey; ties go to the earliest. */
-function mostReady(state: State, who: string, now: number): Task | undefined {
+function mostReady(state: State, who: string, now: number, model?: string): Task | undefined {
   const cooldownMs = withDefaults(state.project.rules).releaseCooldownMinutes * 60_000;
+  const list = (state.project.rules.retryModels ?? []).map((m) => m.toLowerCase());
+  const tiered = list.length > 0;
+  const strong = !!model && list.includes(model.toLowerCase());
   let best: Task | undefined;
   let bestKey: number[] = [];
   for (const t of state.tasks) {
     if (kindOf(t) !== "analyze" || !canTake(state, t, who, now)) continue;
-    const key = queueKey(state, t, now, cooldownMs);
+    const key = queueKey(state, t, now, cooldownMs, strong, tiered);
     if (!best || keyBefore(key, bestKey)) {
       best = t;
       bestKey = key;
@@ -150,7 +182,7 @@ function authorModel(state: State, review: Task): string | undefined {
 }
 
 /** Give someone their current task, or the next one. Checking other people's work comes before new work, then functions whose callees are already named. */
-export function claimTask(state: State, who: string, now = Date.now(), slot = 0): Task | null {
+export function claimTask(state: State, who: string, now = Date.now(), slot = 0, model?: string): Task | null {
   sweepExpired(state, now);
   const mine = state.tasks.find((t) => t.claimedBy === who && (t.claimSlot ?? 0) === slot && activeClaim(t, now));
   if (mine) return mine;
@@ -160,7 +192,7 @@ export function claimTask(state: State, who: string, now = Date.now(), slot = 0)
     const theirs = authorModel(state, t)?.toLowerCase();
     return theirs !== undefined && theirs !== own;
   }) : undefined;
-  const next = diverse ?? reviews[0] ?? mostReady(state, who, now);
+  const next = diverse ?? reviews[0] ?? mostReady(state, who, now, model);
   if (!next) return null;
   next.state = "claimed";
   next.claimedBy = who;
@@ -449,16 +481,20 @@ export function createPoolServer(statePath: string): Server {
         while (badJoinAttempts.length && badJoinAttempts[0] < now - 10 * 60_000) badJoinAttempts.shift();
         if (badJoinAttempts.length >= 20) return send(res, 429, { error: "Too many wrong join codes. Try again in a few minutes." });
         const body = (await readBody(req)) as { code?: unknown; name?: unknown };
-        if (typeof body.code !== "string" || !sameText(body.code, state.joinCode)) {
+        const codeHash = typeof body.code === "string" ? sha256Hex(body.code) : "";
+        const invite = codeHash ? (state.invites ?? []).find((i) => !i.usedAt && sameText(codeHash, i.codeHash)) : undefined;
+        if (!invite && (typeof body.code !== "string" || state.sharedCodeOff || !sameText(body.code, state.joinCode))) {
           badJoinAttempts.push(now);
           return send(res, 403, { error: "That join code is not right." });
         }
-        if (typeof body.name !== "string" || !/^[\w-]{1,30}$/.test(body.name)) {
+        if (invite) body.name = invite.name;
+        if (typeof body.name !== "string" || !NAME_RE.test(body.name)) {
           return send(res, 400, { error: "Pick a short name using letters, digits, - or _." });
         }
         if (state.contributors.some((c) => c.name === body.name)) return send(res, 409, { error: "That name is taken. Pick another with --name." });
         if (state.contributors.length >= rules.maxContributors) return send(res, 403, { error: "This project is full." });
         const token = newToken();
+        if (invite) invite.usedAt = new Date().toISOString();
         state.contributors.push({ name: body.name, tokenHash: sha256Hex(token), joined: new Date().toISOString(), revoked: false });
         saveState(statePath, state);
         return send(res, 200, { token, name: body.name, project: state.project });
@@ -498,18 +534,21 @@ export function createPoolServer(statePath: string): Server {
           graph: graphStats(state),
           stale: staleNotes(state).length,
           known: state.tasks.filter((t) => t.known).length,
+          invitesPending: (state.invites ?? []).filter((i) => !i.usedAt).length,
         });
       }
 
       if (route === "GET /activity") return send(res, 200, buildActivity(state, Date.now(), me.name));
 
       if (route === "POST /claim") {
-        const claimBody = (await readBody(req)) as { slot?: unknown } | null;
+        const claimBody = (await readBody(req)) as { slot?: unknown; model?: unknown } | null;
         const slot = claimBody?.slot ?? 0;
         if (typeof slot !== "number" || !Number.isInteger(slot) || slot < 0 || slot >= rules.maxParallel) {
           return send(res, 400, { error: `slot must be a whole number from 0 to ${rules.maxParallel - 1}.` });
         }
-        const task = claimTask(state, me.name, Date.now(), slot);
+        const model = typeof claimBody?.model === "string" && MODEL_RE.test(claimBody.model) ? claimBody.model : undefined;
+        if (model) me.model = model;
+        const task = claimTask(state, me.name, Date.now(), slot, model ?? me.model);
         saveState(statePath, state);
         const proposal = task && kindOf(task) === "review" ? proposalOf(state, task) : undefined;
         return send(res, 200, {
