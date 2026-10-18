@@ -24,6 +24,7 @@ Pick the task: **join** (they have a join line) or **lead** (they want to start 
 3. Start: `rea-pool/leader start <program file> --name "<name>" --host 0.0.0.0` (Windows: `rea-pool\leader.cmd`). Keep it running.
 4. Give the person the join line it prints, to send to friends. Tell them friends must reach this computer, ideally over a private network such as Tailscale (see `rea-pool/README.md`, "Letting friends connect"). Never expose it to the open internet.
 5. Optional: `rea-pool/leader graph <program file>` (reads the whole program once, about a minute, and fills in who-calls-who for every function).
+6. When the work is finished (or the person asks for the results): `rea-pool/leader apply`. It writes a names file and a Ghidra script; pass on its printed instructions.
 
 ## Rules
 

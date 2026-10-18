@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { NOTE_PROTOCOL } from "./trust.ts";
+import { cleanAlternatives } from "./rules.ts";
 
 interface Config {
   leaderUrl: string;
@@ -21,6 +22,7 @@ interface Claim {
   task: { id: string; kind?: string; address: string } | null;
   proposal?: unknown;
   callees?: unknown;
+  callers?: unknown;
   handoff?: { text: string }[];
   twins?: unknown;
   finished: boolean;
@@ -78,6 +80,7 @@ const TOOLS = [
         name: { type: "string", description: "snake_case function name" },
         summary: { type: "string", description: "One plain sentence describing what the function does" },
         confidence: { type: "string", enum: ["low", "medium", "high"] },
+        alternatives: { type: "array", items: { type: "string" }, maxItems: 3, description: "Optional: up to 3 other plausible snake_case names" },
       },
       required: ["name", "summary", "confidence"],
       additionalProperties: false,
@@ -144,6 +147,7 @@ async function callTool(name: string, args: Record<string, unknown>, state: { ta
         task: { id: claim.task.id, kind: claim.task.kind ?? "analyze", address: claim.task.address },
         code,
         callees: claim.callees,
+        callers: claim.callers,
         proposal: claim.task.kind === "review" ? claim.proposal : undefined,
         earlier_attempts: claim.handoff?.map((h) => h.text),
         similar_functions: claim.twins,
@@ -160,7 +164,8 @@ async function callTool(name: string, args: Record<string, unknown>, state: { ta
       const level = typeof confidence === "string" && ["low", "medium", "high"].includes(confidence) ? confidence : "low";
       const common = { confidence: level, model: config.model ?? "unknown", agent: "rea-pool-mcp", evidence: ["decompiled by Ghidra via rea"] };
       const notes = [{ kind: "function_name", value: fname, ...common }, { kind: "comment", value: summary, ...common }];
-      const { results } = await api<{ results: { status: string; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape });
+      const alternatives = cleanAlternatives(args.alternatives, fname);
+      const { results } = await api<{ results: { status: string; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });
       state.taskId = undefined;
       const accepted = results.find((r) => r.status !== "rejected");
       const rejected = results.find((r) => r.status === "rejected");

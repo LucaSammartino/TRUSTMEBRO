@@ -1,10 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { Confidence, Note, NoteStatus, Proposal, State, Task, Verdict } from "./types.ts";
-import { checkText, validateNote, type RawNote } from "./rules.ts";
+import { checkText, IDENTIFIER, validateNote, type RawNote } from "./rules.ts";
 import { initialStatus, proposalConfidence, resolveVotes, withDefaults } from "./trust.ts";
 import { newToken, readJson, sha256Hex, writeJsonAtomic } from "./util.ts";
-import { addCallees, basedOn, calleeContext, cleanCallees, graphStats, readiness, staleNotes } from "./graph.ts";
+import { addCallees, basedOn, calleeContext, callerContext, cleanCallees, needsRefinement, graphStats, readiness, staleNotes } from "./graph.ts";
 import { isShape, twinHints, twinPotential } from "./similar.ts";
 import { buildActivity } from "./activity.ts";
 import { LIVE_HTML } from "./live.ts";
@@ -134,12 +134,33 @@ export function releaseTasks(state: State, who: string, note: unknown, now = Dat
   return { released: mine.length, noted };
 }
 
+const knownModel = (m: string | undefined): string | undefined => (m && m !== "unknown" ? m : undefined);
+
+/** The model label on this person's most recent note. Self-reported, so only ever a soft preference. */
+function latestModel(state: State, who: string): string | undefined {
+  for (let i = state.notes.length - 1; i >= 0; i--) if (state.notes[i].author === who) return knownModel(state.notes[i].model);
+  return undefined;
+}
+
+/** The model label the author of a review task's proposal gave. */
+function authorModel(state: State, review: Task): string | undefined {
+  const proposal = proposalOf(state, review);
+  const note = proposal && state.notes.find((n) => n.proposalId === proposal.id);
+  return knownModel(note?.model);
+}
+
 /** Give someone their current task, or the next one. Checking other people's work comes before new work, then functions whose callees are already named. */
 export function claimTask(state: State, who: string, now = Date.now(), slot = 0): Task | null {
   sweepExpired(state, now);
   const mine = state.tasks.find((t) => t.claimedBy === who && (t.claimSlot ?? 0) === slot && activeClaim(t, now));
   if (mine) return mine;
-  const next = state.tasks.find((t) => kindOf(t) === "review" && canTake(state, t, who, now)) ?? mostReady(state, who, now);
+  const reviews = state.tasks.filter((t) => kindOf(t) === "review" && canTake(state, t, who, now));
+  const own = latestModel(state, who)?.toLowerCase();
+  const diverse = own ? reviews.find((t) => {
+    const theirs = authorModel(state, t)?.toLowerCase();
+    return theirs !== undefined && theirs !== own;
+  }) : undefined;
+  const next = diverse ?? reviews[0] ?? mostReady(state, who, now);
   if (!next) return null;
   next.state = "claimed";
   next.claimedBy = who;
@@ -210,12 +231,38 @@ export interface NoteResult {
   id: string;
 }
 
+export const DUPLICATE_NAME = "that name is already used by another function";
+
+/** Is this function name already a known name of another function, or a trusted/pending function_name note of another function? */
+export function nameTakenElsewhere(state: State, task: Task, value: string): boolean {
+  const v = value.toLowerCase();
+  if (state.tasks.some((t) => t.id !== task.id && t.known?.name.toLowerCase() === v)) return true;
+  return state.notes.some((n) => n.taskId !== task.id && n.kind === "function_name" && (n.status === "trusted" || n.status === "pending") && n.value.toLowerCase() === v);
+}
+
+/** Keep valid, distinct identifiers that differ from the main name; at most 3; ignore the rest silently. */
+export function cleanAlternatives(value: unknown, primary?: string): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>(primary ? [primary.toLowerCase()] : []);
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string" || !IDENTIFIER.test(item) || seen.has(item.toLowerCase())) continue;
+    seen.add(item.toLowerCase());
+    out.push(item);
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+
 /** Someone finished an analysis task and sent notes. */
-export function submitAnalysis(state: State, who: string, task: Task, rawNotes: RawNote[], now = new Date()): NoteResult[] {
+export function submitAnalysis(state: State, who: string, task: Task, rawNotes: RawNote[], now = new Date(), alternatives?: string[]): NoteResult[] {
   const proposalId = randomUUID();
   const based = basedOn(calleeContext(state, task.address));
   const notes: Note[] = rawNotes.map((raw) => {
-    const verdict = validateNote(raw ?? {}, state.project.rules);
+    let verdict = validateNote(raw ?? {}, state.project.rules);
+    if (verdict.ok && raw?.kind === "function_name" && nameTakenElsewhere(state, task, String(raw.value ?? "").slice(0, 600))) {
+      verdict = { ok: false, reason: DUPLICATE_NAME };
+    }
     return {
       id: randomUUID(),
       taskId: task.id,
@@ -236,6 +283,8 @@ export function submitAnalysis(state: State, who: string, task: Task, rawNotes: 
   if (valid.length > 0) {
     const confidence = proposalConfidence(valid.map((n) => n.confidence));
     const proposal: Proposal = { id: proposalId, taskId: task.id, author: who, confidence, status: initialStatus(confidence), votes: [], at: now.toISOString() };
+    const alts = cleanAlternatives(alternatives, valid.find((n) => n.kind === "function_name")?.value);
+    if (alts.length > 0) proposal.alternatives = alts;
     state.proposals.push(proposal);
     state.notes.push(...notes);
     for (const n of valid) {
@@ -253,6 +302,7 @@ export function submitAnalysis(state: State, who: string, task: Task, rawNotes: 
   task.doneBy = [...(task.doneBy ?? []), who];
   settleAnalysisTask(state, task);
   flagStale(state, now.getTime());
+  scheduleRefinement(state);
   return notes.map((n) => ({ ok: n.status !== "rejected", status: n.status, reason: n.reason, id: n.id }));
 }
 
@@ -285,7 +335,23 @@ export function submitReview(state: State, who: string, task: Task, verdict: Ver
     if (analysis && outcome !== "trusted") settleAnalysisTask(state, analysis);
   }
   flagStale(state, now.getTime());
+  scheduleRefinement(state);
   return { recorded: true, proposalStatus: outcome };
+}
+
+/**
+ * When all work is finished, give each function that ended with no trusted name one more pass, now that its
+ * callers are named. A function is reopened at most once (refined); whoever did it before is not given it again.
+ */
+export function scheduleRefinement(state: State): number {
+  if (state.tasks.some((t) => t.state !== "done")) return 0;
+  const todo = state.tasks.filter((t) => needsRefinement(state, t));
+  for (const t of todo) {
+    t.refined = true;
+    t.state = "open";
+    t.attempts = 1;
+  }
+  return todo.length;
 }
 
 /**
@@ -323,6 +389,7 @@ export function overrideNote(state: State, noteId: string, status: "trusted" | "
     note.reason = "set by leader";
   }
   flagStale(state);
+  scheduleRefinement(state);
   return true;
 }
 
@@ -430,6 +497,7 @@ export function createPoolServer(statePath: string): Server {
           finished: isFinishedFor(state, me.name),
           graph: graphStats(state),
           stale: staleNotes(state).length,
+          known: state.tasks.filter((t) => t.known).length,
         });
       }
 
@@ -447,8 +515,9 @@ export function createPoolServer(statePath: string): Server {
         return send(res, 200, {
           task,
           // What the reviewer is asked to check. It is other people's text, so the reviewer treats it as data, never as instructions.
-          proposal: proposal ? { notes: proposalNotes(state, proposal.id).map((n) => ({ kind: n.kind, value: n.value })) } : undefined,
+          proposal: proposal ? { notes: proposalNotes(state, proposal.id).map((n) => ({ kind: n.kind, value: n.value })), alternatives: proposal.alternatives ?? [] } : undefined,
           callees: task ? calleeContext(state, task.address) : [],
+          callers: task ? callerContext(state, task.address) : [],
           // Other people's text again: the worker treats it as data. Only for functions being analyzed.
           handoff: task && kindOf(task) === "analyze" ? (task.handoff ?? []) : [],
           twins: task && kindOf(task) === "analyze" ? twinHints(state, task) : [],
@@ -464,7 +533,7 @@ export function createPoolServer(statePath: string): Server {
       }
 
       if (route === "POST /submit") {
-        const body = (await readBody(req)) as { taskId?: unknown; notes?: unknown; protocol?: unknown; verdict?: unknown; callees?: unknown; shape?: unknown };
+        const body = (await readBody(req)) as { taskId?: unknown; notes?: unknown; protocol?: unknown; verdict?: unknown; callees?: unknown; shape?: unknown; alternatives?: unknown };
         if (body.protocol !== rules.protocol) {
           return send(res, 400, { error: `This project uses note format "${rules.protocol}" but you sent "${String(body.protocol)}". Update your pool tool.` });
         }
@@ -483,7 +552,7 @@ export function createPoolServer(statePath: string): Server {
         }
         if (Array.isArray(body.callees)) addCallees(task, cleanCallees(body.callees, task.address));
         if (isShape(body.shape)) task.shape = body.shape;
-        const results = submitAnalysis(state, me.name, task, body.notes as RawNote[]);
+        const results = submitAnalysis(state, me.name, task, body.notes as RawNote[], new Date(), cleanAlternatives(body.alternatives));
         saveState(statePath, state);
         return send(res, 200, { results });
       }

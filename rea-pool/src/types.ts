@@ -78,6 +78,10 @@ export interface Task {
   shape?: string;
   /** For analyze tasks: how many times this was reopened because a callee name changed under it. */
   reopened?: number;
+  /** A name Ghidra or the program's symbols already gave this function. Such tasks are created "done" and need no work. */
+  known?: { name: string; source: "ghidra" };
+  /** True once this finished function was reopened for a second pass because callers got named. Happens at most once. */
+  refined?: boolean;
 }
 
 /**
@@ -128,6 +132,8 @@ export interface Proposal {
   status: NoteStatus;
   votes: Vote[];
   at: string;
+  /** Other names the author considered, for the reviewer to weigh. At most 3. */
+  alternatives?: string[];
 }
 
 export interface Contributor {

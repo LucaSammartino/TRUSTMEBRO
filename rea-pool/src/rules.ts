@@ -81,3 +81,17 @@ export function validateNote(note: RawNote, rules: Rules): Checked {
   }
   return { ok: true };
 }
+
+/** Other plausible names from an AI or a user: strings only, valid identifiers, no duplicates, not the main name, at most 3. */
+export function cleanAlternatives(list: unknown, primary?: string): string[] {
+  if (!Array.isArray(list)) return [];
+  const out: string[] = [];
+  for (const item of list) {
+    if (typeof item !== "string") continue;
+    const name = item.trim();
+    if (!IDENTIFIER.test(name) || name === primary || out.includes(name)) continue;
+    out.push(name);
+    if (out.length === 3) break;
+  }
+  return out;
+}

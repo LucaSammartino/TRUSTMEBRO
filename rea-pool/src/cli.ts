@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { NoteStatus, Project, Task } from "./types.ts";
 import { allPassed, runAllChecks } from "./check.ts";
 import { NOTE_PROTOCOL } from "./trust.ts";
+import { cleanAlternatives } from "./rules.ts";
 import { analyzeAsync, detectAi, inspectFunction, reviewAsync, type AgentContext } from "./agent.ts";
 import type { Activity } from "./activity.ts";
 import { renderActivity } from "./watch.ts";
@@ -106,6 +107,7 @@ interface ClaimReply {
   task: Task | null;
   proposal?: { notes: { kind: string; value: string }[] };
   callees?: { address: string; name: string }[];
+  callers?: { address: string; name: string }[];
   handoff?: { text: string }[];
   twins?: { address: string; name: string }[];
   finished: boolean;
@@ -165,12 +167,12 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
       try {
         let outcome: string;
         if (isReview) {
-          const verdict = await reviewAsync(ctx, task.address, claim.proposal?.notes ?? [], claim.callees ?? []);
+          const verdict = await reviewAsync(ctx, task.address, claim.proposal?.notes ?? [], claim.callees ?? [], claim.callers ?? []);
           await api(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, verdict });
           outcome = `you said: ${verdict}`;
         } else {
-          const { notes, callees, shape } = await analyzeAsync(ctx, task.address, claim.callees ?? [], { handoff: claim.handoff, twins: claim.twins });
-          const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, notes, callees, shape });
+          const { notes, callees, shape, alternatives } = await analyzeAsync(ctx, task.address, claim.callees ?? [], { handoff: claim.handoff, twins: claim.twins }, claim.callers ?? []);
+          const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });
           outcome = describe(results.find((r) => r.status !== "rejected")?.status ?? "rejected", results.find((r) => r.status === "rejected")?.reason);
         }
         say(start + outcome);
@@ -344,6 +346,7 @@ async function main() {
             task: { id: claim.task.id, kind: claim.task.kind ?? "analyze", address: claim.task.address },
             code,
             callees: claim.callees,
+            callers: claim.callers,
             proposal: isReview ? claim.proposal : undefined,
             earlier_attempts: claim.handoff?.map((h) => h.text),
             similar_functions: claim.twins,
@@ -360,7 +363,7 @@ async function main() {
       const config = loadConfig();
       const { name, summary, confidence } = flags;
       if (!name || name === "true" || !summary || summary === "true") {
-        console.error('Usage: pool submit --name <snake_case_name> --summary "<one plain sentence>" --confidence low|medium|high');
+        console.error('Usage: pool submit --name <snake_case_name> --summary "<one plain sentence>" --confidence low|medium|high [--alt other_name,another_name]');
         process.exit(1);
       }
       const claim = await api<ClaimReply>(config, "POST", "/claim");
@@ -372,7 +375,8 @@ async function main() {
       const level = ["low", "medium", "high"].includes(confidence) ? confidence : "low";
       const common = { confidence: level, model: flags.model ?? config.model ?? "unknown", agent: "rea-pool-skill", evidence: ["decompiled by Ghidra via rea"] };
       const notes = [{ kind: "function_name", value: name, ...common }, { kind: "comment", value: summary, ...common }];
-      const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape });
+      const alternatives = flags.alt && flags.alt !== "true" ? cleanAlternatives(flags.alt.split(","), name) : [];
+      const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });
       console.log(describe(results.find((r) => r.status !== "rejected")?.status ?? "rejected", results.find((r) => r.status === "rejected")?.reason));
       break;
     }

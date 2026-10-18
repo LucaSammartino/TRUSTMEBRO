@@ -2,7 +2,7 @@
 // Leader tool. One command does the setup:  leader start <software-file>
 import { randomBytes } from "node:crypto";
 import { runCommand, runCommandAsync } from "./exec.ts";
-import { fillCalleesFromDump } from "./agent.ts";
+import { fillCalleesFromDump, markKnownFromDump } from "./agent.ts";
 import { loadDump, prepareTarget } from "./prepare.ts";
 import { addCallees, calleesFromReaFunction, graphStats, normalizeAddress } from "./graph.ts";
 import { isShape, shapeOf } from "./similar.ts";
@@ -68,11 +68,14 @@ function usage(): never {
                                       Save trusted results (--best: one winner per function and kind)
   prepare <software-file> [--force]   Read the whole program once into a local cache (about a minute);
                                       after this, graph and every task are instant
-  graph <software-file> [--no-prepare] [--parallel 4] [--limit N]
+  graph <software-file> [--no-prepare] [--keep-named] [--parallel 4] [--limit N]
                                       Read which function calls which. Prepares the cache first (see
                                       "prepare"). With --no-prepare, or for functions missing from the
                                       cache, asks rea one function at a time (slow: ~40s each, in
                                       parallel). Safe to stop with Ctrl+C and run again to continue.
+                                      Functions Ghidra already named (not FUN_...) are skipped;
+                                      --keep-named turns that off (for programs that still have symbols)
+  apply [out-dir]                     Write the trusted names for Ghidra (default ./pool-data/apply)
   revoke <person>                     Cancel someone's access
   approve <note-id> | reject <note-id>
                                       Optional overrides. You never need these.
@@ -214,6 +217,13 @@ async function buildGraph(file: string, dataDir: string, statePath: string, flag
         // Short read-modify-write: reload so changes made by the running server are not lost.
         mergeGraphIntoState(statePath, graph, shapes);
         console.log(`Filled ${filled} functions from the local cache.`);
+      }
+      // Short read-modify-write again, so the running server's changes are kept.
+      const fresh = loadState(statePath);
+      const known = markKnownFromDump(fresh, file, { keepNamed: flags["keep-named"] !== undefined });
+      if (known > 0) {
+        saveState(statePath, fresh);
+        console.log(`${known} functions already have real names from Ghidra; skipping them`);
       }
     } catch (err) {
       console.log(`Could not use the quick method (${err instanceof Error ? err.message : err}); using the slower one.`);
@@ -457,6 +467,20 @@ async function main() {
         process.exit(1);
       }
       await buildGraph(file, dataDir, statePath, flags);
+      break;
+    }
+    case "apply": {
+      const state = needState();
+      const outDir = rest[0] ?? join(dataDir, "apply");
+      let writeApplyBundle: (s: State, dir: string) => { namesFile: string; scriptFile: string; count: number };
+      try {
+        ({ writeApplyBundle } = await import("./apply.ts"));
+      } catch {
+        console.error("This version has no apply support (src/apply.ts is missing).");
+        process.exit(1);
+      }
+      const r = writeApplyBundle(state, outDir);
+      console.log(`Wrote ${r.count} names to ${r.namesFile}. To apply them in Ghidra: open your program, Window > Script Manager, add ${outDir} as a script folder and run ApplyNames.java, then choose names.json. Or headless: analyzeHeadless <projectDir> <project> -process <program> -scriptPath ${outDir} -postScript ApplyNames.java ${r.namesFile}`);
       break;
     }
     case "notes": {

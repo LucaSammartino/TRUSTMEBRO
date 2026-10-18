@@ -50,6 +50,7 @@ function analysisTaskAt(state: State, address: string): Task | undefined {
 export function trustedName(state: State, address: string): string | undefined {
   const task = analysisTaskAt(state, address);
   if (!task) return undefined;
+  if (task.known) return task.known.name;
   const winners = state.notes.filter((n) => n.taskId === task.id && n.kind === "function_name" && n.status === "trusted").sort(compareNotes);
   return winners[0]?.value;
 }
@@ -92,6 +93,27 @@ export function calleeContext(state: State, address: string): CalleeInfo[] {
     if (out.length >= MAX_CONTEXT) break;
   }
   return out;
+}
+
+/** The functions that call this one and already have a trusted or known name (at most 30). Same shape as calleeContext. */
+export function callerContext(state: State, address: string): CalleeInfo[] {
+  const me = normalizeAddress(address);
+  if (!me) return [];
+  const out: CalleeInfo[] = [];
+  for (const t of state.tasks) {
+    if ((t.kind ?? "analyze") !== "analyze" || !t.callees?.includes(me)) continue;
+    const name = trustedName(state, t.address);
+    if (name) out.push({ address: normalizeAddress(t.address) ?? t.address, name });
+    if (out.length >= MAX_CONTEXT) break;
+  }
+  return out;
+}
+
+/** Pure: should this finished function get one more pass now that its callers are named? */
+export function needsRefinement(state: State, task: Task): boolean {
+  if ((task.kind ?? "analyze") !== "analyze" || task.state !== "done" || task.known || task.refined) return false;
+  if (state.proposals.some((p) => p.taskId === task.id && p.status === "trusted")) return false;
+  return callerContext(state, task.address).length > 0;
 }
 
 /** The same list as text lines, for notes: which callee names this answer was built on. */

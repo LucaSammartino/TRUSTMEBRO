@@ -79,7 +79,7 @@ test("HTTP submissions persist normalized callees and exclude junk and self call
       assert.equal(claimed.body.task.id, taskId);
       const submitted = await call(alice, "POST", "/submit", {
         protocol: NOTE_PROTOCOL, taskId: claimed.body.task.id,
-        notes: notes("process_input"), callees: ["0x00B", "0xC", "junk"],
+        notes: notes(`process_input_${expected.length}`), callees: ["0x00B", "0xC", "junk"],
       });
       assert.equal(submitted.status, 200);
       assert.deepEqual(submitted.body.results.map((r: { status: string }) => r.status), ["trusted", "trusted"]);
