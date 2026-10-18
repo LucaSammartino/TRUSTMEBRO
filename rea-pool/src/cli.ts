@@ -9,7 +9,10 @@ import { fileURLToPath } from "node:url";
 import type { NoteStatus, Project, Task } from "./types.ts";
 import { allPassed, runAllChecks } from "./check.ts";
 import { NOTE_PROTOCOL } from "./trust.ts";
-import { analyze, detectAi, inspectFunction, review, type AgentContext } from "./agent.ts";
+import { analyzeAsync, detectAi, inspectFunction, reviewAsync, type AgentContext } from "./agent.ts";
+import type { Activity } from "./activity.ts";
+import { renderActivity } from "./watch.ts";
+import { runMcpServer } from "./mcp.ts";
 
 interface Config {
   leaderUrl: string;
@@ -131,47 +134,80 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
   patient = true;
   console.log(`Running as ${config.name}. Press Ctrl+C to stop; your task goes back to the pool.\n`);
 
+  const asked = Math.floor(Number(flags.parallel ?? 1));
+  let parallel = Math.min(4, Math.max(1, Number.isFinite(asked) ? asked : 1));
+  const allowed = project.rules?.maxParallel;
+  if (allowed !== undefined && parallel > allowed) {
+    parallel = Math.max(1, allowed);
+    console.log(`This project allows ${parallel} at a time, so running ${parallel}.`);
+  }
+
+  // Shared by all loops: 5 failures in a row overall stop everything.
   let failures = 0;
-  let waiting = false;
   let done = 0;
+  const worker = async (slot: number): Promise<void> => {
+    const say = (text: string) => console.log(parallel > 1 ? `[${slot}] ${text}` : text);
+    let waiting = false;
+    while (true) {
+      const claim = await api<ClaimReply>(config, "POST", "/claim", { slot });
+      if (!claim.task) {
+        if (claim.finished) return;
+        if (!waiting) say("Waiting for other contributors to finish (checking again every 30 seconds)...");
+        waiting = true;
+        await sleep(30_000);
+        continue;
+      }
+      waiting = false;
+      const task = claim.task;
+      const isReview = task.kind === "review";
+      const start = `${isReview ? "Checking" : "Analyzing"} ${task.label} ... `;
+      try {
+        let outcome: string;
+        if (isReview) {
+          const verdict = await reviewAsync(ctx, task.address, claim.proposal?.notes ?? [], claim.callees ?? []);
+          await api(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, verdict });
+          outcome = `you said: ${verdict}`;
+        } else {
+          const { notes, callees, shape } = await analyzeAsync(ctx, task.address, claim.callees ?? [], { handoff: claim.handoff, twins: claim.twins });
+          const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, notes, callees, shape });
+          outcome = describe(results.find((r) => r.status !== "rejected")?.status ?? "rejected", results.find((r) => r.status === "rejected")?.reason);
+        }
+        say(start + outcome);
+        failures = 0;
+        done++;
+      } catch (err) {
+        say(`${start}failed: ${err instanceof Error ? err.message : err}`);
+        await api(config, "POST", "/release", { taskId: task.id, note: failureNote(err) });
+        if (++failures >= 5) {
+          console.error("\nToo many failures in a row, stopping. Fix the problem above and run again.");
+          process.exit(1);
+        }
+        await sleep(10_000 * failures);
+      }
+      if (flags.once) return;
+    }
+  };
+  await Promise.all(Array.from({ length: parallel }, (_, slot) => worker(slot)));
+  if (!flags.once) console.log(`\nNothing left to do. You finished ${done} task(s). Thank you!`);
+}
+
+/** Redraw the project dashboard every few seconds. Network trouble shows a message and keeps trying. */
+async function watchLoop(config: Config, once: boolean): Promise<void> {
+  const tty = Boolean(process.stdout.isTTY);
+  const base = config.leaderUrl.replace(/\/$/, "");
   while (true) {
-    const claim = await api<ClaimReply>(config, "POST", "/claim");
-    if (!claim.task) {
-      if (claim.finished) {
-        console.log(`\nNothing left to do. You finished ${done} task(s). Thank you!`);
-        return;
-      }
-      if (!waiting) console.log("Waiting for other contributors to finish (checking again every 30 seconds)...");
-      waiting = true;
-      await sleep(30_000);
-      continue;
-    }
-    waiting = false;
-    const task = claim.task;
-    const isReview = task.kind === "review";
-    process.stdout.write(`${isReview ? "Checking" : "Analyzing"} ${task.label} ... `);
+    let frame: string;
     try {
-      if (isReview) {
-        const verdict = review(ctx, task.address, claim.proposal?.notes ?? [], claim.callees ?? []);
-        await api(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, verdict });
-        console.log(`you said: ${verdict}`);
-      } else {
-        const { notes, callees, shape } = analyze(ctx, task.address, claim.callees ?? [], { handoff: claim.handoff, twins: claim.twins });
-        const { results } = await api<{ results: { status: NoteStatus; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: task.id, notes, callees, shape });
-        console.log(describe(results.find((r) => r.status !== "rejected")?.status ?? "rejected", results.find((r) => r.status === "rejected")?.reason));
-      }
-      failures = 0;
-      done++;
-    } catch (err) {
-      console.log(`failed: ${err instanceof Error ? err.message : err}`);
-      await api(config, "POST", "/release", { note: failureNote(err) });
-      if (++failures >= 5) {
-        console.error("\nToo many failures in a row, stopping. Fix the problem above and run again.");
-        process.exit(1);
-      }
-      await sleep(10_000 * failures);
+      const res = await fetch(base + "/activity", { headers: { authorization: `Bearer ${config.token}` } });
+      const data = (await res.json().catch(() => ({}))) as Activity & { error?: string };
+      frame = res.ok ? renderActivity(data, { width: process.stdout.columns || 80, color: tty && !process.env.NO_COLOR }) : `The leader said: ${data.error ?? "something went wrong"}`;
+    } catch {
+      frame = "reconnecting...";
     }
-    if (flags.once) return;
+    if (tty && !once) process.stdout.write("\x1b[2J\x1b[H");
+    console.log(frame);
+    if (once || !tty) return;
+    await sleep(3_000);
   }
 }
 
@@ -238,6 +274,13 @@ async function main() {
     }
     case "run":
       await runLoop(loadConfig(), flags);
+      break;
+    case "watch":
+      await watchLoop(loadConfig(), flags.once === "true");
+      break;
+    case "mcp":
+      // stdout carries only JSON-RPC here: print nothing else.
+      await runMcpServer();
       break;
     case "release": {
       const note = flags.note && flags.note !== "true" ? flags.note : "";
@@ -317,6 +360,8 @@ async function main() {
       mkdirSync(target, { recursive: true });
       writeFileSync(join(target, "SKILL.md"), readFileSync(source));
       console.log(`Installed the rea-pool skill in ${target}. In Claude Code, ask it to "work through the rea-pool tasks" and it will do the rest.`);
+      console.log(`Or add it as an MCP server instead:
+  claude mcp add rea-pool -- node "${fileURLToPath(new URL("./mcp.ts", import.meta.url))}"`);
       break;
     }
     default:
@@ -324,14 +369,17 @@ async function main() {
 
   join <address> <join-code> --target <file>   Join a project (--name to pick a name)
   run                                          Do tasks until there are none left (add --once for just one)
+  watch [--once]                               Live dashboard of the project (refreshes every 3 seconds)
   check                                        Check your setup matches the project
   status                                       See progress
   set-target <path>                            Change where your copy of the software is
   release --note "<what you tried>"            Give your current task back
   connect                                      Install the skill so an AI agent can work in the pool by itself
+  mcp                                          Run as an MCP server over stdin/stdout (for AI tools)
   next | submit | verdict                      Do tasks by hand (used by the skill; "pool run" does all of this for you)
 
-Options for run:  --ai "<command>"  use a specific AI command   --model <name>  label the model you use`);
+Options for run:  --ai "<command>"  use a specific AI command   --model <name>  label the model you use
+                  --parallel <1-4>  work on several tasks at once (limited by the project's rules)`);
   }
 }
 

@@ -24,6 +24,10 @@ export interface Rules {
   maxContributors?: number;
   /** After someone gives up on a function (or their lease runs out), how long it waits at the back of the queue. */
   releaseCooldownMinutes?: number;
+  /** How many times a finished function may be reopened because a callee name it was built on changed. */
+  maxReopens?: number;
+  /** How many tasks one person may work on at the same time (claim slots 0..maxParallel-1). */
+  maxParallel?: number;
 }
 
 /** What someone who gave up on a function tells the next person: what they tried and what is still unclear. */
@@ -53,6 +57,8 @@ export interface Task {
   size?: number;
   state: "open" | "claimed" | "done";
   claimedBy?: string;
+  /** Which of the claimer's parallel slots holds this task. Missing means 0. */
+  claimSlot?: number;
   leaseUntil?: string;
   /** Everyone who has already done this task. They are never given it again. */
   doneBy?: string[];
@@ -70,6 +76,8 @@ export interface Task {
   handoff?: Handoff[];
   /** For analyze tasks: fingerprint of the decompiled code's structure. Functions sharing one are probably copies of each other. */
   shape?: string;
+  /** For analyze tasks: how many times this was reopened because a callee name changed under it. */
+  reopened?: number;
 }
 
 /**
@@ -99,6 +107,8 @@ export interface Note {
   agrees?: number;
   /** The trusted callee names the pool had when this was written, as "address=name". Lets a later rename be noticed. */
   basedOn?: string[];
+  /** True when a callee name this note was built on is no longer the pool's trusted name. */
+  stale?: boolean;
 }
 
 export type Verdict = "agree" | "disagree" | "unsure";

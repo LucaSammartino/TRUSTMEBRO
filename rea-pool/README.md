@@ -1,125 +1,62 @@
-# rea-pool
+# rea-pool: details
 
-Lets a group of people point their own AI at the **same piece of software** and pool the results. Nobody uploads the software or any code. Everyone already has their own copy; only small notes ("this function is called `parse_packet` and it does X") travel over the internet.
+You don't need this page to use the tool; the steps are in the [main README](../README.md). This is for when you want to know what is going on or do things by hand.
 
-There is **one leader** (who sets it up once) and any number of **contributors** (who just run one command and leave it going). Nobody reviews anything by hand: the AIs check each other.
+## By hand, without an AI agent
 
-> Status: version 0.2. Works on **Windows, Linux and macOS** (including Apple Silicon). Automated tests run on all three on every change, including a clean-room install and a real analysis, and confirm all three systems find the identical list of functions in the same program. **Not yet tested:** two real computers talking over a network, and the Claude command-line step end to end (its login had expired during development).
+Windows uses `START-HERE.cmd` / `pool.cmd` / `leader.cmd`. macOS uses `START-HERE.command`. Linux/macOS use `bash setup.sh`, `./pool`, `./leader`.
 
-## Easy install for friends
-
-Get this folder (zip or copy) and put it anywhere, then:
-
-| System | Do this |
+| I want to... | Do this |
 |---|---|
-| **Windows** | Double-click `START-HERE.cmd` |
-| **macOS** | Double-click `START-HERE.command`. If macOS refuses (downloaded files lose their "runnable" mark), open Terminal, type `bash ` (with a space), drag `setup.sh` into the window and press Enter |
-| **Linux** | Open a terminal in this folder and run `bash setup.sh` |
+| Set up and join (friend) | Double-click `START-HERE.cmd` (Windows) or `START-HERE.command` (macOS), or `bash setup.sh` (Linux). It asks before installing anything. |
+| Set up only (leader) | `SETUP-ONLY.cmd`, or `bash setup.sh --mode setup-only` |
+| Start a project | `leader start <program file> --name "Name" --host 0.0.0.0` |
+| Join | `pool join <address> <join-code> --target <program file>` |
+| Work | `pool run` (needs the Claude command line: <https://claude.com/download>, then `claude auth login` once). Any other AI: `pool run --ai "<command: prompt on stdin, answer on stdout>"` |
+| Work in parallel | `pool run --parallel 3` |
+| Let an AI agent work | `pool connect`, or point your agent at the MCP server `node src/mcp.ts` |
+| Watch | `pool watch`, `leader watch`, or open `http://<leader address>:8787/live` |
+| See progress / results | `leader status`, `leader export results.json --best` |
+| Read the call graph up front | `leader graph <program file> --parallel 4` (slow: ~40 s per function; safe to stop and rerun) |
+| Remove someone / change the join code | `leader revoke <name>` / `leader new-code` |
 
-That is all. It checks each thing you need, **asks before installing anything that is missing**, and then walks you through joining. It needs about 3 GB of free disk space and an internet connection the first time.
+Setup needs about 3 GB of disk and internet the first time. It installs Node 24, Java 21, Ghidra 12.1.4 (checked against its published fingerprint) and rea 6.7.0 into your own folder (`~/.rea-pool`); on Windows it sets `JAVA_HOME`, `GHIDRA_INSTALL_DIR` and `REA_ANALYSIS_PROVIDER` for your user. Apple Silicon Macs build Ghidra's decompiler once (needs `xcode-select --install` and `brew install bison`).
 
-What it checks and installs:
+## Letting friends connect
 
-| Thing | Why | How |
-|---|---|---|
-| Node.js 24+ | runs this tool | Windows: winget. Linux/macOS: official download, fingerprint-checked, into `~/.rea-pool` |
-| Java 21 (JDK) | Ghidra needs it; your other Java versions are untouched | Windows: winget. Linux/macOS: Eclipse Temurin download, fingerprint-checked |
-| Ghidra 12.1.4 (about 570 MB) | reads the software | downloaded from the official GitHub page, **verified against its published fingerprint**, unpacked into your own folder |
-| Ghidra's decompiler program | part of reading the software | normally included; **Apple Silicon Macs** need it built from source inside the download (a few minutes; needs Apple's developer tools: `xcode-select --install`, and `brew install bison`). The script tells you if something is missing |
-| rea 6.7.0 | lets an AI read the software | npm |
-| An AI | does the thinking | **not installed for you**: install the Claude command line from <https://claude.com/download>, run `claude auth login` in a normal window once, then run the start file again |
+Friends connect to the leader's computer with ordinary web requests, so it must be reachable and stay on.
 
-On Linux/macOS nothing needs administrator rights: everything goes into `~/.rea-pool`, and the settings are saved in `~/.rea-pool/env.sh`, which the `./pool` and `./leader` commands load for you. On Windows it sets three settings for your user (`JAVA_HOME`, `GHIDRA_INSTALL_DIR`, `REA_ANALYSIS_PROVIDER`). If something goes wrong it says exactly what, and running it again continues where it left off. When it asks, paste the "pool join" line your friend sent you and drag the software file into the window. Leave the window open and walk away; run the start file again any time to continue.
+1. Install [Tailscale](https://tailscale.com) (free) on both computers and share the leader's computer. Its address looks like `100.x.y.z`.
+2. Start with `--host 0.0.0.0` and give friends `http://100.x.y.z:8787`.
+3. Do not put it on the open internet: traffic is not encrypted and anyone with the join code can join.
 
-Everyone also needs their own copy of the software (the exact same file; it is checked by fingerprint). Tested with a Windows 64-bit program (`.dll`) analyzed on all three systems. rea supports other kinds of programs, but we have not tested them.
+## How results become trusted
 
-Other AIs work too if you pass a command: `pool run --ai "<command that reads a prompt on stdin and prints an answer>"`.
-
-Tested on clean machines (in GitHub's test computers): the Linux and macOS installer, and the Windows installer for Ghidra and rea. **Not tested on a clean Windows computer:** the winget installs of Node and Java. If one fails, the script says where to download that piece by hand.
-
-## Leader: set it up (once)
-
-First run the setup (`SETUP-ONLY.cmd` on Windows; `bash setup.sh --mode setup-only` on Linux/macOS): same checks and installs as above, without joining anything. Then, in a terminal in this folder:
-
-```
-leader.cmd start <your copy of the software> --name "My project"      (Windows)
-./leader start <your copy of the software> --name "My project"        (Linux/macOS)
-```
-
-That one command fingerprints the software, records the tool versions **you** have installed as the requirements, asks rea for every function (one task each), and starts the server. It then prints a line to send to friends:
-
-```
-pool join http://<your-address>:8787 jc_xxxxxxxx --target <path to their copy>
-```
-
-The same code works for everyone, so you do not create invites one by one. Run `start` again later to resume. `status` shows progress; `export results.json --best` saves the trusted results.
-
-### Letting friends connect
-
-Friends' tools connect to **your** computer over the internet (ordinary web requests). Your computer must be reachable, and your computer must stay on while they work.
-
-1. Easiest and safest: both of you install [Tailscale](https://tailscale.com) (free), sign in, and share your computer with your friend. Your Tailscale address looks like `100.x.y.z`.
-2. Start with `leader.cmd start <file> --host 0.0.0.0` (Windows) or `./leader start <file> --host 0.0.0.0` (Linux/macOS) and give your friend `http://100.x.y.z:8787` as the address.
-3. Do **not** put this on the open internet as it is. Traffic is not encrypted, and anyone with the join code can join. Use `new-code` to replace the code, `revoke <name>` to remove someone.
-
-## Contributor: join and run
-
-Normally the start file does this for you. By hand (use `pool.cmd` on Windows, `./pool` on Linux/macOS):
-
-```
-pool join <address> <join-code> --target <your copy of the software>
-pool run
-```
-
-`join` also checks your setup. `run` then takes a task, analyzes it with rea and your AI, sends the notes, and repeats until nothing is left. Stop any time with Ctrl+C. Your current task goes back to the pool.
-
-## How results become trusted (automatically)
-
-Each function is a task. Someone's AI proposes a name and a short description with a confidence (low/medium/high). What happens next depends only on that confidence, because an AI's own confidence is a reasonable guide to whether it is right:
+Each function is a task. An AI proposes a name and one sentence with a confidence.
 
 | Confidence | What happens |
 |---|---|
-| **High** | Trusted immediately. |
-| **Medium** | Another contributor's AI checks it (never the author). It agrees: trusted. It disagrees: a second checker decides. Two disagreements reject it. |
-| **Low** | Kept only as a hint. The function goes back to the pool for a different contributor to try again (up to 3 attempts). |
+| High | Trusted immediately. |
+| Medium | Another contributor's AI checks it (never the author). Agree: trusted. Two disagreements: rejected. |
+| Low | Kept as a hint; someone else tries again (up to 3 attempts). |
 
-Checking comes before new work, and nobody does the same function twice. If checkers cannot settle something it is left as an unverified hint, never trusted.
+Checking comes before new work and nobody does the same function twice. Every note is checked automatically: same program and tool versions, plain names, no links, file paths, hex blobs or instructions to an AI. Other people's notes are always treated as data.
 
-Safety rules run automatically on every note: same file and tool versions required, names limited to letters/digits/underscores, no web links, no file paths, no long hex blobs, and nothing that looks like instructions to an AI. Notes that break them are rejected. Other people's notes are always treated as data by the checking AI, never as instructions.
+## What keeps a crowd efficient
 
-The model name a note carries is only informational (it cannot be proven), so it never affects trust.
+- **Bottom-up:** functions whose callees already have trusted names go first, and those names are shown to the AI. `basedOn` records which names a note used; if one later changes, the note is marked stale and the function is reopened once.
+- **Give-ups cool down** at the back of the queue (`releaseCooldownMinutes`, default 15), and leave a hand-off note for the next worker. Expired leases count as give-ups.
+- **Copies:** functions with the same structure are fingerprinted; once one has a trusted name, the others get it as a hint, never as an answer.
+- **Network blips:** `pool run` waits and retries for about ten minutes.
 
-## Working bottom-up (call graph)
+## Limits
 
-Functions are easier to name once the functions they call already have trusted names. The pool uses this in two ways:
-
-- Whoever analyzes a function also reports which functions it calls, so the pool learns the call graph as it goes.
-- Functions whose callees are already named are handed out first, and those trusted names are shown to the AI as context. Names that are still being checked are never shown.
-
-The leader can also read the whole graph up front with `leader graph <software file> --parallel 4`. Each function takes about 40 seconds because Ghidra starts fresh every time, so run it in parallel; it is safe to stop with Ctrl+C and run again to continue. `leader status` shows how much of the graph is known.
-
-## Keeping unattended workers productive
-
-Nothing here waits for a human. The pool is built to keep a crowd of AIs from wasting effort:
-
-- **Leases expire by themselves.** A worker that vanishes loses its function after `leaseMinutes`; that counts as giving up.
-- **Give-ups cool down.** A function someone gave up on goes to the back of the queue for `releaseCooldownMinutes` (default 15), so a crowd does not pass the same hard leftovers around. It still comes when nothing else is left. Among equals, the function given up on least goes first.
-- **Hand-off notes.** `pool release --note "what I tried and what is unclear"` (the worker does this by itself after an error) leaves a note that the next worker sees as untrusted context. A missing or unacceptable note never blocks the release; a generic line is stored instead.
-- **Copies.** Functions that decompile to the same structure (statically linked libraries, copy-pasted helpers) are fingerprinted. The first of a group of copies is done early, and once it has a trusted name the others are shown it as a hint (never as an answer). `leader graph` records fingerprints too (`shapes.json`).
-- **Network blips.** `pool run` waits and retries for about ten minutes instead of stopping.
-
-An AI agent such as Claude Code can work a pool without `pool run`: `pool connect` installs a skill (`skill/SKILL.md`) and the agent then loops over `pool next`, `pool submit`, `pool verdict` and `pool release` by itself.
-
-## What it does not do
-
-- It cannot prove a result is *correct*, only that it passed these checks. Treat results as strong suggestions.
-- It does not stop fake agreement between accounts one person controls. That is fine among friends; do not open it to strangers without more protection.
-- It is not encrypted and not meant for the open internet.
-- Accuracy has not been measured; expect it to drop on software the AI has not seen much of.
-- Many tasks are tiny wrapper functions where nobody can tell the purpose from the code alone; those end as hints.
+- Results pass checks but are not proven correct. Treat them as strong suggestions.
+- Fake agreement between accounts one person controls is not prevented. Fine among friends; not for strangers.
+- Not encrypted, not for the open internet.
+- Accuracy has not been measured and will be lower on unfamiliar software. Tiny wrapper functions usually end as hints.
+- Tested on Windows, Linux and macOS with a Windows `.dll`. Not yet tested: two real computers over a network, the winget installs on a clean Windows PC, and the Claude command line end to end.
 
 ## Files
 
-`src/leader.ts` (leader tool), `src/cli.ts` (contributor tool), `src/server.ts` (the rules of the pool and the web server), `src/trust.ts` (confidence and voting rules), `src/agent.ts` (talks to rea and the AI), `src/graph.ts` (call graph: which function calls which), `src/similar.ts` (fingerprints for copies of a function), `skill/SKILL.md` (lets an AI agent work a pool unattended), `src/rules.ts` (note safety rules), `src/check.ts` (setup checks), `test/` (automated tests).
-
-Run the tests with `npm test`.
+`src/leader.ts`, `src/cli.ts` (the two tools), `src/server.ts` (rules and web server), `src/trust.ts` (voting), `src/graph.ts` (call graph, stale names), `src/similar.ts` (copies), `src/agent.ts` (rea and the AI), `src/mcp.ts` (MCP server), `src/activity.ts` and `src/live.ts` (live view), `src/rules.ts` (note safety), `src/check.ts` (setup checks), `skill/SKILL.md` (agent instructions), `test/`. Run the tests with `npm test`.

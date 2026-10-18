@@ -10,6 +10,8 @@ import { networkInterfaces } from "node:os";
 import type { Note, Project, State, Task, ToolSpec } from "./types.ts";
 import { createPoolServer, loadState, overrideNote, saveState } from "./server.ts";
 import { readVersion } from "./check.ts";
+import { buildActivity } from "./activity.ts";
+import { renderActivity } from "./watch.ts";
 import { compareNotes, NOTE_PROTOCOL } from "./trust.ts";
 import { readJson, sha256File, writeJsonAtomic } from "./util.ts";
 
@@ -57,6 +59,7 @@ function usage(): never {
         Set everything up (first time) and run the server. Run it again later to resume.
   link [--port 8787]                  Show the line friends use to join
   status                              Show progress
+  watch [--once]                      Live progress screen, refreshed every 3 seconds
   notes [--status trusted|pending|hint|rejected]
                                       List what has been sent in
   export <out.json> [--best] [--include-unverified]
@@ -128,6 +131,7 @@ async function createProject(file: string, dataDir: string, name: string | undef
       maxVotes: 5,
       maxContributors: 50,
       releaseCooldownMinutes: 15,
+      maxParallel: 4,
     },
   };
   return { project, joinCode: newJoinCode(), contributors: [], tasks: [], notes: [], proposals: [] };
@@ -378,6 +382,24 @@ async function main() {
       console.log(`  ${formatGraphStats(state)}`);
       console.log(`  Results: ${count("trusted")} trusted, ${count("pending")} waiting for a check, ${count("hint")} hints, ${count("rejected")} rejected`);
       console.log(`  People: ${state.contributors.filter((c) => !c.revoked).map((c) => c.name).join(", ") || "nobody yet"}`);
+      break;
+    }
+    case "watch": {
+      needState();
+      const frame = () => {
+        const out = renderActivity(buildActivity(loadState(statePath), Date.now()), { width: process.stdout.columns ?? 80, color: !!process.stdout.isTTY });
+        if (process.stdout.isTTY && flags.once === undefined) process.stdout.write("\x1b[2J\x1b[H");
+        console.log(out);
+      };
+      frame();
+      if (flags.once !== undefined || !process.stdout.isTTY) break;
+      setInterval(() => {
+        try {
+          frame();
+        } catch {
+          // The server may be mid-write; the next frame will do.
+        }
+      }, 3000);
       break;
     }
     case "graph": {

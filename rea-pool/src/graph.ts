@@ -1,6 +1,6 @@
 // The call graph: which function calls which, so the pool can work from the bottom up.
 // A function is easier to name once the functions it calls already have trusted names.
-import type { State, Task } from "./types.ts";
+import type { Note, State, Task } from "./types.ts";
 import { compareNotes } from "./trust.ts";
 
 const MAX_CALLEES = 200;
@@ -97,6 +97,18 @@ export function calleeContext(state: State, address: string): CalleeInfo[] {
 /** The same list as text lines, for notes: which callee names this answer was built on. */
 export function basedOn(context: CalleeInfo[]): string[] {
   return context.map((c) => `${c.address}=${c.name}`);
+}
+
+/** Trusted notes built on a callee name that is no longer the trusted one (changed, or no trusted name left). Pure. */
+export function staleNotes(state: State): Note[] {
+  return state.notes.filter((n) => {
+    if (n.status !== "trusted" || !n.basedOn || n.basedOn.length === 0) return false;
+    return n.basedOn.some((entry) => {
+      const i = entry.indexOf("=");
+      if (i < 0) return false;
+      return trustedName(state, entry.slice(0, i)) !== entry.slice(i + 1);
+    });
+  });
 }
 
 /** Record callees for an analysis task. Returns true if anything changed. Existing knowledge is kept, new addresses are added. */

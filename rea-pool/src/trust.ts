@@ -12,6 +12,8 @@ export function withDefaults(rules: Rules): Required<Rules> {
     maxVotes: rules.maxVotes ?? 5,
     maxContributors: rules.maxContributors ?? 50,
     releaseCooldownMinutes: rules.releaseCooldownMinutes ?? 15,
+    maxReopens: rules.maxReopens ?? 1,
+    maxParallel: rules.maxParallel ?? 4,
   };
 }
 

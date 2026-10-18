@@ -4,8 +4,10 @@ import type { Confidence, Note, NoteStatus, Proposal, State, Task, Verdict } fro
 import { checkText, validateNote, type RawNote } from "./rules.ts";
 import { initialStatus, proposalConfidence, resolveVotes, withDefaults } from "./trust.ts";
 import { newToken, readJson, sha256Hex, writeJsonAtomic } from "./util.ts";
-import { addCallees, basedOn, calleeContext, cleanCallees, graphStats, readiness } from "./graph.ts";
+import { addCallees, basedOn, calleeContext, cleanCallees, graphStats, readiness, staleNotes } from "./graph.ts";
 import { isShape, twinHints, twinPotential } from "./similar.ts";
+import { buildActivity } from "./activity.ts";
+import { LIVE_HTML } from "./live.ts";
 
 const MAX_HANDOFFS = 5;
 
@@ -113,8 +115,8 @@ const NO_NOTE = "Gave up without a usable note.";
  * that, and the function waits at the back of the queue for a while. Never refuses: an unattended worker must not
  * get stuck on a bad note, so a missing or unusable one is replaced by a generic line.
  */
-export function releaseTasks(state: State, who: string, note: unknown, now = Date.now()): ReleaseResult {
-  const mine = state.tasks.filter((t) => t.state === "claimed" && t.claimedBy === who);
+export function releaseTasks(state: State, who: string, note: unknown, now = Date.now(), taskId?: string): ReleaseResult {
+  const mine = state.tasks.filter((t) => t.state === "claimed" && t.claimedBy === who && (taskId === undefined || t.id === taskId));
   const rules = withDefaults(state.project.rules);
   const trimmed = typeof note === "string" ? note.trim() : "";
   const noted = trimmed !== "" && checkText(trimmed, rules.maxTextLength) === null;
@@ -133,14 +135,15 @@ export function releaseTasks(state: State, who: string, note: unknown, now = Dat
 }
 
 /** Give someone their current task, or the next one. Checking other people's work comes before new work, then functions whose callees are already named. */
-export function claimTask(state: State, who: string, now = Date.now()): Task | null {
+export function claimTask(state: State, who: string, now = Date.now(), slot = 0): Task | null {
   sweepExpired(state, now);
-  const mine = state.tasks.find((t) => t.claimedBy === who && activeClaim(t, now));
+  const mine = state.tasks.find((t) => t.claimedBy === who && (t.claimSlot ?? 0) === slot && activeClaim(t, now));
   if (mine) return mine;
   const next = state.tasks.find((t) => kindOf(t) === "review" && canTake(state, t, who, now)) ?? mostReady(state, who, now);
   if (!next) return null;
   next.state = "claimed";
   next.claimedBy = who;
+  next.claimSlot = slot;
   next.leaseUntil = new Date(now + withDefaults(state.project.rules).leaseMinutes * 60_000).toISOString();
   return next;
 }
@@ -158,6 +161,7 @@ export function proposalNotes(state: State, proposalId: string): Note[] {
 
 function release(task: Task): void {
   delete task.claimedBy;
+  delete task.claimSlot;
   delete task.leaseUntil;
 }
 
@@ -248,6 +252,7 @@ export function submitAnalysis(state: State, who: string, task: Task, rawNotes: 
 
   task.doneBy = [...(task.doneBy ?? []), who];
   settleAnalysisTask(state, task);
+  flagStale(state, now.getTime());
   return notes.map((n) => ({ ok: n.status !== "rejected", status: n.status, reason: n.reason, id: n.id }));
 }
 
@@ -279,7 +284,30 @@ export function submitReview(state: State, who: string, task: Task, verdict: Ver
     const analysis = state.tasks.find((t) => t.id === proposal.taskId);
     if (analysis && outcome !== "trusted") settleAnalysisTask(state, analysis);
   }
+  flagStale(state, now.getTime());
   return { recorded: true, proposalStatus: outcome };
+}
+
+/**
+ * Mark notes whose callee names changed as stale (and clear the mark when they match again). A finished function
+ * with a stale note goes back to the pool, up to maxReopens times; people who did it before stay in doneBy.
+ */
+export function flagStale(state: State, now = Date.now()): number {
+  const stale = new Set(staleNotes(state));
+  for (const n of state.notes) {
+    if (stale.has(n)) n.stale = true;
+    else if (n.stale) n.stale = false;
+  }
+  const max = withDefaults(state.project.rules).maxReopens;
+  const ids = new Set([...stale].map((n) => n.taskId));
+  for (const t of state.tasks) {
+    if (!ids.has(t.id) || kindOf(t) !== "analyze" || t.state !== "done" || activeClaim(t, now)) continue;
+    if ((t.reopened ?? 0) >= max) continue;
+    if (state.proposals.some((p) => p.taskId === t.id && p.status === "pending")) continue;
+    t.state = "open";
+    t.reopened = (t.reopened ?? 0) + 1;
+  }
+  return stale.size;
 }
 
 /** Leader override: force a whole proposal trusted or rejected. */
@@ -294,6 +322,7 @@ export function overrideNote(state: State, noteId: string, status: "trusted" | "
     note.status = status;
     note.reason = "set by leader";
   }
+  flagStale(state);
   return true;
 }
 
@@ -368,6 +397,16 @@ export function createPoolServer(statePath: string): Server {
         return send(res, 200, { token, name: body.name, project: state.project });
       }
 
+      // The live page holds no data (it fetches /activity with the person's token), so it needs no token itself.
+      if (route === "GET /live") {
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'",
+          "cache-control": "no-store",
+        });
+        return res.end(LIVE_HTML);
+      }
+
       const header = req.headers.authorization ?? "";
       const token = header.startsWith("Bearer ") ? header.slice(7) : "";
       const hash = sha256Hex(token);
@@ -390,11 +429,19 @@ export function createPoolServer(statePath: string): Server {
           yourProposals: state.proposals.filter((p) => p.author === me.name).length,
           finished: isFinishedFor(state, me.name),
           graph: graphStats(state),
+          stale: staleNotes(state).length,
         });
       }
 
+      if (route === "GET /activity") return send(res, 200, buildActivity(state, Date.now(), me.name));
+
       if (route === "POST /claim") {
-        const task = claimTask(state, me.name);
+        const claimBody = (await readBody(req)) as { slot?: unknown } | null;
+        const slot = claimBody?.slot ?? 0;
+        if (typeof slot !== "number" || !Number.isInteger(slot) || slot < 0 || slot >= rules.maxParallel) {
+          return send(res, 400, { error: `slot must be a whole number from 0 to ${rules.maxParallel - 1}.` });
+        }
+        const task = claimTask(state, me.name, Date.now(), slot);
         saveState(statePath, state);
         const proposal = task && kindOf(task) === "review" ? proposalOf(state, task) : undefined;
         return send(res, 200, {
@@ -410,8 +457,8 @@ export function createPoolServer(statePath: string): Server {
       }
 
       if (route === "POST /release") {
-        const body = (await readBody(req)) as { note?: unknown };
-        const result = releaseTasks(state, me.name, body.note);
+        const body = (await readBody(req)) as { note?: unknown; taskId?: unknown };
+        const result = releaseTasks(state, me.name, body.note, Date.now(), typeof body.taskId === "string" ? body.taskId : undefined);
         saveState(statePath, state);
         return send(res, 200, { ok: true, ...result });
       }

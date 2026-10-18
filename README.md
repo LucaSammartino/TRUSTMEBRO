@@ -2,29 +2,31 @@
 
 **T**eam-built **R**everse-engineering **U**sing **S**lop, **T**otally **M**ostly **E**xact, **B**inaries **R**ecreated **O**ptimistically
 
-A collaborative, vibecoded decompilation pipeline. Output is approximate, the code was written on vibes, and nobody using it needs to know how any of this works.
+Many people point their own AI at the same program and pool what it figures out. Nobody uploads the program: only short notes travel ("this function is called `parse_packet` and does X"). You don't need to know anything about AI or decompiling.
 
-> Trust me, bro.
+## Join a project
 
-## What it does
+1. Download this repo (green **Code** button, then **Download ZIP**) and unzip it.
+2. Open your AI agent (Claude Code, Codex, Gemini...) in that folder.
+3. Tell it: **"Read AGENTS.md and join this project."** Give it the join line and the program file your leader sent you.
+4. Let it go to work. Stop any time; start again later the same way.
 
-Many people point their own AI at the **same piece of software** and pool the results. Nobody uploads the software or any code: everyone has their own copy, and only small notes ("this function is called `parse_packet` and does X") travel over the internet. One person is the **leader** and sets it up; everyone else just runs one command and leaves it going. Nobody reviews anything by hand, because the AIs check each other (high-confidence results are trusted, medium ones get an independent check, low ones are retried by someone else).
+## Lead a project
 
-It is built on [rea](https://github.com/morluto/rea) (which lets an AI read software through Ghidra).
+1. Download this repo and unzip it.
+2. Open your AI agent in that folder.
+3. Tell it: **"Read AGENTS.md and start a project for this file."** Give it the program file.
+4. Send the join line it prints to your friends.
 
-## Start here
+## Watch it work
 
-- **Join a project:** Windows: double-click `rea-pool/START-HERE.cmd`. macOS: double-click `rea-pool/START-HERE.command`. Linux: run `bash rea-pool/setup.sh`. It checks what you need, asks before installing anything, and walks you through joining.
-- **Run a project:** run the setup first (`SETUP-ONLY.cmd`, or `bash setup.sh --mode setup-only`), then `leader.cmd start <software file>` (Windows) or `./leader start <software file>` (Linux/macOS). See [`rea-pool/README.md`](rea-pool/README.md).
+Run `pool watch` (friends) or `leader watch` (leader) for a live view, or open `http://<leader address>:8787/live`.
 
-## Honest status
+## Good to know
 
-Early (v0.2). Runs on **Windows, Linux and macOS** (Apple Silicon included): automated tests on all three check the pool's rules (24 tests), a clean-room install, and a real Ghidra analysis, and confirm every system finds the same functions in the same program. **Not yet tested:** two real computers over a network, a clean Windows install of the Node/Java installers, and the Claude command-line step end to end. Accuracy has not been measured, and will be lower on unfamiliar software. Results are strong suggestions, not proof.
+- Results are suggestions, not proof. Early version.
+- Only analyze software you are allowed to analyze. Reverse-engineering rules differ by country and license. This is not legal advice.
+- It is not encrypted and not meant for the open internet: use a private network such as [Tailscale](https://tailscale.com).
+- How it works, settings and manual commands: [`rea-pool/README.md`](rea-pool/README.md).
 
-## Please use it responsibly
-
-Only analyze software you are allowed to analyze. Reverse-engineering rules differ by country and by license (many licenses forbid it), and the tool does not check this for you. It never transmits the software itself, but shared notes can still describe it. This is not legal advice.
-
-## License
-
-MIT, see [`LICENSE`](LICENSE).
+MIT license, see [`LICENSE`](LICENSE). Built on [rea](https://github.com/morluto/rea).
