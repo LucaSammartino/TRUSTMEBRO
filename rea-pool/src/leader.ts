@@ -3,6 +3,7 @@
 import { randomBytes } from "node:crypto";
 import { runCommand, runCommandAsync } from "./exec.ts";
 import { addCallees, calleesFromReaFunction, graphStats, normalizeAddress } from "./graph.ts";
+import { isShape, shapeOf } from "./similar.ts";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { networkInterfaces } from "node:os";
@@ -126,6 +127,7 @@ async function createProject(file: string, dataDir: string, name: string | undef
       maxAttempts: 3,
       maxVotes: 5,
       maxContributors: 50,
+      releaseCooldownMinutes: 15,
     },
   };
   return { project, joinCode: newJoinCode(), contributors: [], tasks: [], notes: [], proposals: [] };
@@ -153,11 +155,17 @@ function printJoinLine(state: State, port: string, host: string): void {
 }
 
 /** Short read-modify-write of state.json: copy known callees from the graph file into tasks that lack them. */
-function mergeGraphIntoState(statePath: string, graph: Record<string, string[]>): number {
+function mergeGraphIntoState(statePath: string, graph: Record<string, string[]>, shapes: Record<string, string> = {}): number {
   const state = loadState(statePath);
   let merged = 0;
   for (const task of state.tasks) {
-    if ((task.kind ?? "analyze") !== "analyze" || task.callees) continue;
+    if ((task.kind ?? "analyze") !== "analyze") continue;
+    const shape = shapes[normalizeAddress(task.address) ?? ""];
+    if (shape && !task.shape && isShape(shape)) {
+      task.shape = shape;
+      merged++;
+    }
+    if (task.callees) continue;
     const callees = graph[normalizeAddress(task.address) ?? ""];
     if (!callees) continue;
     addCallees(task, callees);
@@ -173,12 +181,14 @@ async function buildGraph(file: string, dataDir: string, statePath: string, flag
   const limit = num(flags.limit, Infinity);
   const graphPath = join(dataDir, "graph.json");
   const graph: Record<string, string[]> = existsSync(graphPath) ? readJson<Record<string, string[]>>(graphPath) : {};
+  const shapesPath = join(dataDir, "shapes.json");
+  const shapes: Record<string, string> = existsSync(shapesPath) ? readJson<Record<string, string>>(shapesPath) : {};
 
   const first = loadState(statePath);
   const isCandidate = (t: Task) => (t.kind ?? "analyze") === "analyze" && t.callees === undefined;
   const fromFile = first.tasks.filter((t) => isCandidate(t) && graph[normalizeAddress(t.address) ?? ""]).length;
   if (fromFile > 0) {
-    mergeGraphIntoState(statePath, graph);
+    mergeGraphIntoState(statePath, graph, shapes);
     console.log(`Applied ${fromFile} functions saved by an earlier run.`);
   }
   const queue = loadState(statePath)
@@ -206,7 +216,7 @@ async function buildGraph(file: string, dataDir: string, statePath: string, flag
   const merge = () => {
     sinceMerge = 0;
     try {
-      mergeGraphIntoState(statePath, graph);
+      mergeGraphIntoState(statePath, graph, shapes);
     } catch (err) {
       console.error(`Could not update the project state: ${err instanceof Error ? err.message : err}`);
     }
@@ -234,6 +244,12 @@ async function buildGraph(file: string, dataDir: string, statePath: string, flag
         if (!parsed.normalized_result) throw new Error("no normalized_result in output");
         graph[normalizeAddress(item.address) ?? item.address] = calleesFromReaFunction(parsed.normalized_result, item.address);
         writeJsonAtomic(graphPath, graph);
+        const pseudocode = (parsed.normalized_result as { pseudocode?: unknown }).pseudocode;
+        const shape = shapeOf(pseudocode);
+        if (shape) {
+          shapes[normalizeAddress(item.address) ?? item.address] = shape;
+          writeJsonAtomic(shapesPath, shapes);
+        }
         done++;
         if (++sinceMerge >= 25) merge();
       } catch (err) {

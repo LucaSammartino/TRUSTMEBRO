@@ -14,6 +14,7 @@ rea-pool/examples/
 twouser/
 bench/
 **/graph.json
+**/shapes.json
 **/bench-*/
 **/results*.json
 *.zip

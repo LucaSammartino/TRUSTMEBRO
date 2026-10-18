@@ -1,10 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { Confidence, Note, NoteStatus, Proposal, State, Task, Verdict } from "./types.ts";
-import { validateNote, type RawNote } from "./rules.ts";
+import { checkText, validateNote, type RawNote } from "./rules.ts";
 import { initialStatus, proposalConfidence, resolveVotes, withDefaults } from "./trust.ts";
 import { newToken, readJson, sha256Hex, writeJsonAtomic } from "./util.ts";
 import { addCallees, basedOn, calleeContext, cleanCallees, graphStats, readiness } from "./graph.ts";
+import { isShape, twinHints, twinPotential } from "./similar.ts";
+
+const MAX_HANDOFFS = 5;
 
 const MAX_BODY = 64 * 1024;
 
@@ -50,23 +53,88 @@ export function canTake(state: State, task: Task, who: string, now: number): boo
   return true;
 }
 
-/** Of the analysis tasks someone can take, the one whose callees are most ready; ties go to the earliest. */
+/** A function someone just gave up on waits at the back of the queue, so a crowd does not pass the same hard leftovers around. */
+function isCooling(task: Task, now: number, cooldownMs: number): boolean {
+  return !!task.releasedAt && Date.parse(task.releasedAt) + cooldownMs > now;
+}
+
+/** Lower sorts first: not cooling, callees most ready, given up on least, then the one with the most unnamed copies. */
+function queueKey(state: State, task: Task, now: number, cooldownMs: number): number[] {
+  return [isCooling(task, now, cooldownMs) ? 1 : 0, readiness(state, task), task.abandons ?? 0, -twinPotential(state, task)];
+}
+
+function keyBefore(a: number[], b: number[]): boolean {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] < b[i];
+  return false;
+}
+
+/** Of the analysis tasks someone can take, the best by queueKey; ties go to the earliest. */
 function mostReady(state: State, who: string, now: number): Task | undefined {
+  const cooldownMs = withDefaults(state.project.rules).releaseCooldownMinutes * 60_000;
   let best: Task | undefined;
-  let bestScore = Infinity;
+  let bestKey: number[] = [];
   for (const t of state.tasks) {
     if (kindOf(t) !== "analyze" || !canTake(state, t, who, now)) continue;
-    const score = readiness(state, t);
-    if (score < bestScore) {
+    const key = queueKey(state, t, now, cooldownMs);
+    if (!best || keyBefore(key, bestKey)) {
       best = t;
-      bestScore = score;
+      bestKey = key;
     }
   }
   return best;
 }
 
+/** Leases that ran out count as giving up: the function goes back to the pool, marked, and waits its turn. */
+export function sweepExpired(state: State, now = Date.now()): number {
+  let swept = 0;
+  for (const t of state.tasks) {
+    if (!isExpired(t, now)) continue;
+    if (kindOf(t) === "analyze") {
+      t.abandons = (t.abandons ?? 0) + 1;
+      t.releasedAt = t.leaseUntil;
+    }
+    t.state = "open";
+    release(t);
+    swept++;
+  }
+  return swept;
+}
+
+export interface ReleaseResult {
+  released: number;
+  /** False when the note was missing or unusable and a generic one was stored instead. */
+  noted: boolean;
+}
+
+const NO_NOTE = "Gave up without a usable note.";
+
+/**
+ * Someone gives their current task back, saying what they tried and what is unclear: the next person starts from
+ * that, and the function waits at the back of the queue for a while. Never refuses: an unattended worker must not
+ * get stuck on a bad note, so a missing or unusable one is replaced by a generic line.
+ */
+export function releaseTasks(state: State, who: string, note: unknown, now = Date.now()): ReleaseResult {
+  const mine = state.tasks.filter((t) => t.state === "claimed" && t.claimedBy === who);
+  const rules = withDefaults(state.project.rules);
+  const trimmed = typeof note === "string" ? note.trim() : "";
+  const noted = trimmed !== "" && checkText(trimmed, rules.maxTextLength) === null;
+  const text = noted ? trimmed : NO_NOTE;
+  for (const t of mine) {
+    if (kindOf(t) === "analyze") {
+      const at = new Date(now).toISOString();
+      t.abandons = (t.abandons ?? 0) + 1;
+      t.releasedAt = at;
+      t.handoff = [...(t.handoff ?? []), { by: who, text, at }].slice(-MAX_HANDOFFS);
+    }
+    t.state = "open";
+    release(t);
+  }
+  return { released: mine.length, noted };
+}
+
 /** Give someone their current task, or the next one. Checking other people's work comes before new work, then functions whose callees are already named. */
 export function claimTask(state: State, who: string, now = Date.now()): Task | null {
+  sweepExpired(state, now);
   const mine = state.tasks.find((t) => t.claimedBy === who && activeClaim(t, now));
   if (mine) return mine;
   const next = state.tasks.find((t) => kindOf(t) === "review" && canTake(state, t, who, now)) ?? mostReady(state, who, now);
@@ -327,30 +395,29 @@ export function createPoolServer(statePath: string): Server {
 
       if (route === "POST /claim") {
         const task = claimTask(state, me.name);
-        if (task) saveState(statePath, state);
+        saveState(statePath, state);
         const proposal = task && kindOf(task) === "review" ? proposalOf(state, task) : undefined;
         return send(res, 200, {
           task,
           // What the reviewer is asked to check. It is other people's text, so the reviewer treats it as data, never as instructions.
           proposal: proposal ? { notes: proposalNotes(state, proposal.id).map((n) => ({ kind: n.kind, value: n.value })) } : undefined,
           callees: task ? calleeContext(state, task.address) : [],
+          // Other people's text again: the worker treats it as data. Only for functions being analyzed.
+          handoff: task && kindOf(task) === "analyze" ? (task.handoff ?? []) : [],
+          twins: task && kindOf(task) === "analyze" ? twinHints(state, task) : [],
           finished: task ? false : isFinishedFor(state, me.name),
         });
       }
 
       if (route === "POST /release") {
-        for (const t of state.tasks) {
-          if (t.state === "claimed" && t.claimedBy === me.name) {
-            t.state = "open";
-            release(t);
-          }
-        }
+        const body = (await readBody(req)) as { note?: unknown };
+        const result = releaseTasks(state, me.name, body.note);
         saveState(statePath, state);
-        return send(res, 200, { ok: true });
+        return send(res, 200, { ok: true, ...result });
       }
 
       if (route === "POST /submit") {
-        const body = (await readBody(req)) as { taskId?: unknown; notes?: unknown; protocol?: unknown; verdict?: unknown; callees?: unknown };
+        const body = (await readBody(req)) as { taskId?: unknown; notes?: unknown; protocol?: unknown; verdict?: unknown; callees?: unknown; shape?: unknown };
         if (body.protocol !== rules.protocol) {
           return send(res, 400, { error: `This project uses note format "${rules.protocol}" but you sent "${String(body.protocol)}". Update your pool tool.` });
         }
@@ -368,6 +435,7 @@ export function createPoolServer(statePath: string): Server {
           return send(res, 400, { error: "Send between 1 and 20 notes." });
         }
         if (Array.isArray(body.callees)) addCallees(task, cleanCallees(body.callees, task.address));
+        if (isShape(body.shape)) task.shape = body.shape;
         const results = submitAnalysis(state, me.name, task, body.notes as RawNote[]);
         saveState(statePath, state);
         return send(res, 200, { results });

@@ -19,7 +19,7 @@ It is built on [rea](https://github.com/morluto/rea) (which lets an AI read soft
 
 ## Honest status
 
-Early (v0.2). Runs on **Windows, Linux and macOS** (Apple Silicon included): automated tests on all three check the pool's rules (24 tests), a clean-room install, and a real Ghidra analysis, and confirm every system finds the same functions in the same program. **Not yet tested:** two real computers over a network, a clean Windows install of the Node/Java installers, and the Claude command-line step end to end. In our one accuracy test (29 Lua functions with names hidden), an AI got the right name or purpose about 59% of the time; Lua is probably in its training data, so expect worse on unfamiliar software. Results are strong suggestions, not proof.
+Early (v0.2). Runs on **Windows, Linux and macOS** (Apple Silicon included): automated tests on all three check the pool's rules (24 tests), a clean-room install, and a real Ghidra analysis, and confirm every system finds the same functions in the same program. **Not yet tested:** two real computers over a network, a clean Windows install of the Node/Java installers, and the Claude command-line step end to end. Accuracy has not been measured, and will be lower on unfamiliar software. Results are strong suggestions, not proof.
 
 ## Please use it responsibly
 

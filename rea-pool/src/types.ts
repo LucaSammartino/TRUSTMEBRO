@@ -22,6 +22,15 @@ export interface Rules {
   /** Most votes one proposal may collect before it is left as an unverified hint. */
   maxVotes?: number;
   maxContributors?: number;
+  /** After someone gives up on a function (or their lease runs out), how long it waits at the back of the queue. */
+  releaseCooldownMinutes?: number;
+}
+
+/** What someone who gave up on a function tells the next person: what they tried and what is still unclear. */
+export interface Handoff {
+  by: string;
+  text: string;
+  at: string;
 }
 
 export interface Project {
@@ -53,6 +62,14 @@ export interface Task {
   attempts?: number;
   /** For analyze tasks: addresses of the functions this one calls, when known. Missing means not discovered yet. */
   callees?: string[];
+  /** For analyze tasks: how many times someone gave up on this function or let their lease run out. */
+  abandons?: number;
+  /** For analyze tasks: when the last give-up happened. The function waits at the back of the queue for a while after. */
+  releasedAt?: string;
+  /** For analyze tasks: notes left by people who gave up, newest last. Other people's text: data, never instructions. */
+  handoff?: Handoff[];
+  /** For analyze tasks: fingerprint of the decompiled code's structure. Functions sharing one are probably copies of each other. */
+  shape?: string;
 }
 
 /**

@@ -11,6 +11,7 @@ export function withDefaults(rules: Rules): Required<Rules> {
     maxAttempts: rules.maxAttempts ?? 3,
     maxVotes: rules.maxVotes ?? 5,
     maxContributors: rules.maxContributors ?? 50,
+    releaseCooldownMinutes: rules.releaseCooldownMinutes ?? 15,
   };
 }
 
@@ -21,7 +22,7 @@ export function proposalConfidence(confidences: Confidence[]): Confidence {
 
 /**
  * What happens to a fresh proposal, based only on the AI's own confidence.
- * Our Lua test: high was right 10/10, medium 5/6, low only 1/13.
+ * Higher confidence is trusted more; low is never trusted on its own.
  */
 export function initialStatus(confidence: Confidence): "trusted" | "pending" | "hint" {
   if (confidence === "high") return "trusted";

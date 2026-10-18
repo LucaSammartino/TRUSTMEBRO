@@ -75,7 +75,7 @@ pool run
 
 ## How results become trusted (automatically)
 
-Each function is a task. Someone's AI proposes a name and a short description with a confidence (low/medium/high). What happens next depends only on that confidence, because in our Lua test the AI's own confidence was a good guide (high: 10 of 10 right, medium: 5 of 6, low: 1 of 13):
+Each function is a task. Someone's AI proposes a name and a short description with a confidence (low/medium/high). What happens next depends only on that confidence, because an AI's own confidence is a reasonable guide to whether it is right:
 
 | Confidence | What happens |
 |---|---|
@@ -98,16 +98,28 @@ Functions are easier to name once the functions they call already have trusted n
 
 The leader can also read the whole graph up front with `leader graph <software file> --parallel 4`. Each function takes about 40 seconds because Ghidra starts fresh every time, so run it in parallel; it is safe to stop with Ctrl+C and run again to continue. `leader status` shows how much of the graph is known.
 
+## Keeping unattended workers productive
+
+Nothing here waits for a human. The pool is built to keep a crowd of AIs from wasting effort:
+
+- **Leases expire by themselves.** A worker that vanishes loses its function after `leaseMinutes`; that counts as giving up.
+- **Give-ups cool down.** A function someone gave up on goes to the back of the queue for `releaseCooldownMinutes` (default 15), so a crowd does not pass the same hard leftovers around. It still comes when nothing else is left. Among equals, the function given up on least goes first.
+- **Hand-off notes.** `pool release --note "what I tried and what is unclear"` (the worker does this by itself after an error) leaves a note that the next worker sees as untrusted context. A missing or unacceptable note never blocks the release; a generic line is stored instead.
+- **Copies.** Functions that decompile to the same structure (statically linked libraries, copy-pasted helpers) are fingerprinted. The first of a group of copies is done early, and once it has a trusted name the others are shown it as a hint (never as an answer). `leader graph` records fingerprints too (`shapes.json`).
+- **Network blips.** `pool run` waits and retries for about ten minutes instead of stopping.
+
+An AI agent such as Claude Code can work a pool without `pool run`: `pool connect` installs a skill (`skill/SKILL.md`) and the agent then loops over `pool next`, `pool submit`, `pool verdict` and `pool release` by itself.
+
 ## What it does not do
 
 - It cannot prove a result is *correct*, only that it passed these checks. Treat results as strong suggestions.
 - It does not stop fake agreement between accounts one person controls. That is fine among friends; do not open it to strangers without more protection.
 - It is not encrypted and not meant for the open internet.
-- Our Lua test was easy (Lua is probably in the AI's training data); expect lower accuracy on unfamiliar software.
+- Accuracy has not been measured; expect it to drop on software the AI has not seen much of.
 - Many tasks are tiny wrapper functions where nobody can tell the purpose from the code alone; those end as hints.
 
 ## Files
 
-`src/leader.ts` (leader tool), `src/cli.ts` (contributor tool), `src/server.ts` (the rules of the pool and the web server), `src/trust.ts` (confidence and voting rules), `src/agent.ts` (talks to rea and the AI), `src/graph.ts` (call graph: which function calls which), `src/rules.ts` (note safety rules), `src/check.ts` (setup checks), `test/` (automated tests).
+`src/leader.ts` (leader tool), `src/cli.ts` (contributor tool), `src/server.ts` (the rules of the pool and the web server), `src/trust.ts` (confidence and voting rules), `src/agent.ts` (talks to rea and the AI), `src/graph.ts` (call graph: which function calls which), `src/similar.ts` (fingerprints for copies of a function), `skill/SKILL.md` (lets an AI agent work a pool unattended), `src/rules.ts` (note safety rules), `src/check.ts` (setup checks), `test/` (automated tests).
 
 Run the tests with `npm test`.
