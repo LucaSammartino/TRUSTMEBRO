@@ -6,8 +6,8 @@ import { IS_WINDOWS, runCommand, runCommandAsync, type AsyncResult } from "./exe
 import { cleanCallees, normalizeAddress } from "./graph.ts";
 import { checkText, IDENTIFIER } from "./rules.ts";
 
-export type AnalysisProvider = "corvus-dotnet";
-export type TargetKind = "dotnet" | "il2cpp" | "native";
+export type AnalysisProvider = "corvus-dotnet" | "corvus-android";
+export type TargetKind = "dotnet" | "android" | "il2cpp" | "native";
 export const CORVUS_VERSION = "2.4.0";
 export const CORVUS_FIX = IS_WINDOWS ? "powershell -ExecutionPolicy Bypass -File rea-pool\\setup.ps1 -Mode setup-only -Yes" : "bash rea-pool/setup.sh --mode setup-only --yes";
 
@@ -73,6 +73,8 @@ export function il2cppMetadata(path: string): string | null {
 
 export function detectTargetKind(path: string): TargetKind {
   try {
+    const magic = readAt(path, 0, 8);
+    if (/^dex\n[0-9]{3}\0$/.test(magic.toString("ascii")) || androidZip(path)) return "android";
     const pe = peHeader(path);
     if (pe) {
       const start = pe.plus ? 112 : 96;
@@ -86,8 +88,37 @@ export function detectTargetKind(path: string): TargetKind {
   return "native";
 }
 
+/** Read ZIP entry names only: no extraction, decompression or execution. ZIP64 is left unsupported. */
+function androidZip(path: string): boolean {
+  const size = statSync(path).size;
+  if (size < 22 || readAt(path, 0, 4).toString("hex") !== "504b0304") return false;
+  const start = Math.max(0, size - 65557), tail = readAt(path, start, size - start);
+  for (let i = tail.length - 22; i >= 0; i--) {
+    if (tail.readUInt32LE(i) !== 0x06054b50 || i + 22 + tail.readUInt16LE(i + 20) !== tail.length) continue;
+    const count = tail.readUInt16LE(i + 10), bytes = tail.readUInt32LE(i + 12), at = tail.readUInt32LE(i + 16);
+    if (tail.readUInt32LE(i + 4) !== 0 || tail.readUInt16LE(i + 8) !== count || count === 65535 || at + bytes !== start + i) return false;
+    let cursor = at, found = false;
+    for (let n = 0; n < count; n++) {
+      const header = readAt(path, cursor, 46);
+      if (header.length !== 46 || header.readUInt32LE(0) !== 0x02014b50) return false;
+      const length = header.readUInt16LE(28), extra = header.readUInt16LE(30), comment = header.readUInt16LE(32);
+      if (cursor + 46 + length + extra + comment > at + bytes) return false;
+      const name = readAt(path, cursor + 46, length).toString("utf8");
+      if (/^classes[0-9]*\.dex$/.test(name) || name === "AndroidManifest.xml") found = true;
+      cursor += 46 + length + extra + comment;
+    }
+    return cursor === at + bytes && found;
+  }
+  return false;
+}
+
 export function selectProvider(path: string, noCorvus = false): AnalysisProvider | undefined {
-  return !noCorvus && detectTargetKind(path) === "dotnet" && corvusAvailable() ? "corvus-dotnet" : undefined;
+  const kind = detectTargetKind(path);
+  if (kind === "android") {
+    if (noCorvus || !corvusAvailable()) throw new Error(`Android projects need Corvus ${CORVUS_VERSION}. Run: ${CORVUS_FIX}`);
+    return "corvus-android";
+  }
+  return !noCorvus && kind === "dotnet" && corvusAvailable() ? "corvus-dotnet" : undefined;
 }
 
 type ObjectData = Record<string, unknown>;
@@ -97,12 +128,15 @@ function object(value: unknown, where: string): ObjectData {
 }
 function unexpected(where: string): never { throw new Error(`Corvus returned an unexpected ${where}. No results were imported.`); }
 
+export class CorvusToolError extends Error {}
+
 export function parseCorvusResult(stdout: string, tool: string): ObjectData {
   let value: unknown;
   try { value = JSON.parse(stdout); } catch { return unexpected(`${tool} reply (expected JSON)`); }
   const reply = object(value, `${tool} reply`);
   if (reply.tool !== tool || typeof reply.isError !== "boolean") return unexpected(`${tool} envelope`);
-  if (reply.isError || reply.error) throw new Error(`Corvus could not finish ${tool}. Check its local setup and try again.`);
+  if (reply.isError) throw new CorvusToolError(`Corvus could not finish ${tool}. Check its local setup and try again.`);
+  if (reply.error) return unexpected(`${tool} partial reply`);
   return object(reply.structured, `${tool} structured result`);
 }
 
@@ -124,7 +158,7 @@ export function parseCorvusPage(value: unknown, offset: number): { items: unknow
 
 export interface CorvusStep { tool: string; args: Record<string, unknown> }
 export type CorvusRunner = (program: string, args: string[], options: Parameters<typeof runCommandAsync>[2]) => Promise<AsyncResult>;
-function commandArgs(target: string): string[] { return ["--load", resolve(target), "--json", "--max-output", "20000", "--no-index"]; }
+function commandArgs(target: string, loadTarget = true): string[] { return [...(loadTarget ? ["--load", resolve(target)] : []), "--json", "--max-output", "20000", "--no-index"]; }
 function commandOptions(input?: string) {
   return { input, timeout: 30 * 60_000, maxBuffer: 256 * 1024 * 1024,
     env: { ...process.env, CORVUS_OFFLINE: "1", CORVUS_GHIDRA_DIR: process.env.CORVUS_GHIDRA_DIR || process.env.GHIDRA_INSTALL_DIR } };
@@ -132,7 +166,7 @@ function commandOptions(input?: string) {
 function checkRun(run: AsyncResult): void {
   if (run.error || run.status !== 0) {
     const why = run.status === 124 ? "It took too long." : run.status === 3 ? "A reader it needs is missing." : "Check its local setup.";
-    throw new Error(`Corvus could not read this file. ${why} To install the extra reader: ${CORVUS_FIX}`);
+    throw new CorvusToolError(`Corvus could not read this file. ${why} To install the extra reader: ${CORVUS_FIX}`);
   }
 }
 function batchResults(stdout: string, steps: CorvusStep[]): ObjectData[] {
@@ -149,11 +183,19 @@ function batchResults(stdout: string, steps: CorvusStep[]): ObjectData[] {
 export class CorvusClient {
   target: string;
   runner: CorvusRunner;
-  constructor(target: string, runner: CorvusRunner = runCommandAsync) { this.target = target; this.runner = runner; }
+  loadTarget: boolean;
+  constructor(target: string, runner: CorvusRunner = runCommandAsync) { this.target = target; this.runner = runner; this.loadTarget = detectTargetKind(target) !== "android"; }
   async batch(steps: CorvusStep[]): Promise<ObjectData[]> {
     const binary = findCorvus();
     if (!binary) throw new Error(`This project needs Corvus. Run: ${CORVUS_FIX}`);
-    const run = await this.runner(binary, ["batch", "-", ...commandArgs(this.target), "--stop-on-error"], commandOptions(JSON.stringify(steps)));
+    const run = await this.runner(binary, ["batch", "-", ...commandArgs(this.target, this.loadTarget), "--stop-on-error"], commandOptions(JSON.stringify(steps)));
+    checkRun(run);
+    return batchResults(run.stdout, steps);
+  }
+  batchSync(steps: CorvusStep[], runner = runCommand): ObjectData[] {
+    const binary = findCorvus();
+    if (!binary) throw new Error(`This project needs Corvus. Run: ${CORVUS_FIX}`);
+    const run = runner(binary, ["batch", "-", ...commandArgs(this.target, this.loadTarget), "--stop-on-error"], commandOptions(JSON.stringify(steps)));
     checkRun(run);
     return batchResults(run.stdout, steps);
   }
@@ -185,7 +227,7 @@ export async function listManagedMethods(client: CorvusClient): Promise<ManagedM
     return { address, name: row.label, assembly: row.assembly };
   });
 }
-function methodToken(value: unknown): string | null {
+export function methodToken(value: unknown): string | null {
   return typeof value === "string" && /^0x06[0-9a-f]{6}$/i.test(value) && !/^0x06000000$/i.test(value) ? normalizeAddress(value) : null;
 }
 function managedSteps(target: string, address: string): CorvusStep[] {

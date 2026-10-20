@@ -1,6 +1,6 @@
 // Carry only checked, trusted names. Both game builds stay on this computer.
 import { resolve } from "node:path";
-import { CorvusClient, type CorvusStep } from "./corvus.ts";
+import { CorvusClient, methodToken, parseCorvusPage, type CorvusStep } from "./corvus.ts";
 import { normalizeAddress } from "./graph.ts";
 import { IDENTIFIER, checkText } from "./rules.ts";
 
@@ -67,4 +67,53 @@ export async function migrateBuildNames(oldFile: string, newFile: string, truste
     offset = page.nextOffset;
   }
   throw new Error("Corvus returned too many migration pages. Nothing was imported.");
+}
+
+/** Managed matches are read-only previews; names always come from the checked old export. */
+export function parseManagedMatches(rows: unknown[], trusted: { address: string; name: string }[]): CarriedName[] {
+  const allowed = new Map(trusted.map((n) => [n.address, n.name]));
+  const oldSeen = new Set<string>(), newSeen = new Set<string>(), result: CarriedName[] = [];
+  for (const value of rows) {
+    const row = value as Record<string, unknown> | null;
+    if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("Corvus returned an unexpected managed match. Nothing was imported.");
+    const oldAddress = methodToken(row.oldToken);
+    if (row.kind !== "method" || !oldAddress || !allowed.has(oldAddress) || oldSeen.has(oldAddress)) throw new Error("Corvus returned an unexpected managed method. Nothing was imported.");
+    oldSeen.add(oldAddress);
+    if (row.candidates !== undefined && row.candidates !== null && !Array.isArray(row.candidates)) throw new Error("Corvus returned unexpected match candidates. Nothing was imported.");
+    if ((Array.isArray(row.candidates) && row.candidates.length) || typeof row.how !== "string" || /ambiguous/i.test(row.how)) continue;
+    const strong = (row.confidence === "exact" && row.tier === "full name + signature") ||
+      (row.confidence === "strong" && ["IL hash", "IL hash, other type", "type match + name + signature"].includes(String(row.tier)));
+    if (!strong || row.newToken == null) continue;
+    const address = methodToken(row.newToken), name = allowed.get(oldAddress)!;
+    if (!address || typeof row.new !== "string" || !IDENTIFIER.test(name) || checkText(name, 64) || newSeen.has(address)) throw new Error("Corvus returned an unverified managed name match. Nothing was imported.");
+    newSeen.add(address);
+    result.push({ oldAddress, address, name });
+  }
+  return result;
+}
+
+export async function migrateManagedNames(oldFile: string, newFile: string, trusted: { address: string; name: string }[], client = new CorvusClient(oldFile)): Promise<CarriedName[]> {
+  const rows: unknown[] = [];
+  const oldAssembly = resolve(oldFile), newAssembly = resolve(newFile);
+  const used = new Set<string>(), names = new Set<string>();
+  for (const n of trusted) {
+    if (!methodToken(`0x${n.address.replace(/^0x/, "").padStart(8, "0")}`) || !IDENTIFIER.test(n.name) || checkText(n.name, 64) || used.has(n.address) || names.has(n.name.toLowerCase())) throw new Error("An old managed name or token is unusable. Nothing was imported.");
+    used.add(n.address); names.add(n.name.toLowerCase());
+  }
+  for (let at = 0; at < trusted.length; at += 100) {
+    const symbols = trusted.slice(at, at + 100).map((n) => `0x${n.address.slice(2).padStart(8, "0")}`);
+    let offset = 0, done = false;
+    for (let n = 0; n < 10000; n++) {
+      // Both builds must be loaded in each CLI session; neither build is renamed or saved here.
+      const outputs = await client.batch([{ tool: "load_assembly", args: { path: newAssembly } },
+        { tool: "find_counterpart", args: { oldAssembly, newAssembly, symbols, offset, limit: 100 } }]);
+      const page = parseCorvusPage(outputs[1], offset);
+      if (outputs[1].total !== symbols.length) throw new Error("Corvus did not match the requested method list. Nothing was imported.");
+      rows.push(...page.items);
+      if (page.nextOffset === null) { done = true; break; }
+      offset = page.nextOffset;
+    }
+    if (!done) throw new Error("Corvus returned too many managed match pages. Nothing was imported.");
+  }
+  return parseManagedMatches(rows, trusted);
 }

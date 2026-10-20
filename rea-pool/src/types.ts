@@ -44,8 +44,8 @@ export interface Project {
   name: string;
   created: string;
   target: { filename: string; sha256: string; size: number };
-  /** Missing keeps the original rea/Ghidra reader. Managed projects pin the extra reader. */
-  provider?: "corvus-dotnet";
+  /** Missing keeps the original rea/Ghidra reader. Corvus projects pin the extra reader. */
+  provider?: "corvus-dotnet" | "corvus-android";
   corvusVersion?: string;
   tools: ToolSpec[];
   rules: Rules;

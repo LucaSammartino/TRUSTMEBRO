@@ -94,10 +94,10 @@ export async function checkTarget(project: Project, targetPath: string | undefin
 
 export async function runAllChecks(project: Project, targetPath: string | undefined): Promise<CheckResult[]> {
   const results: CheckResult[] = [await checkTarget(project, targetPath)];
-  if (project.provider !== undefined && project.provider !== "corvus-dotnet") {
+  if (project.provider !== undefined && project.provider !== "corvus-dotnet" && project.provider !== "corvus-android") {
     results.push({ name: "Reader", status: "fail", message: "This project needs a reader this version does not know. Update rea-pool." });
   }
-  if (project.provider === "corvus-dotnet") {
+  if (project.provider === "corvus-dotnet" || project.provider === "corvus-android") {
     const tool = checkTool({ name: "corvus", command: ["corvus", "--version"], versionRegex: "(\\d+\\.\\d+\\.\\d+)", required: project.corvusVersion ?? CORVUS_VERSION, match: "exact" });
     if (tool.status === "fail") tool.message = `This project needs Corvus ${project.corvusVersion ?? CORVUS_VERSION}. Run: ${CORVUS_FIX}`;
     results.push(tool);

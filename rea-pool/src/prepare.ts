@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { inspectAndroid, listAndroidMethods } from "./android.ts";
 import { CorvusClient, CORVUS_VERSION, corvusAvailable, detectTargetKind, inspectManaged, listManagedMethods, type AnalysisProvider } from "./corvus.ts";
 import { runCommandAsync } from "./exec.ts";
 import { normalizeAddress } from "./graph.ts";
@@ -106,14 +107,16 @@ export async function prepareTarget(
   if (!opts.force && validMeta(targetPath, metaFile, dumpFile, opts.provider)) {
     return { dumpFile, functions: metaFunctions(metaFile), seconds: 0, fromCache: true };
   }
-  if (opts.provider === "corvus-dotnet") {
+  if (opts.provider) {
     const started = Date.now();
     const client = opts.corvus ?? new CorvusClient(targetPath);
     log("Reading the game's methods with Corvus...");
-    const methods = await listManagedMethods(client);
+    const methods = opts.provider === "corvus-android" ? await listAndroidMethods(client) : await listManagedMethods(client);
     const entries: DumpEntry[] = [];
     for (const method of methods) {
-      const inspected = await inspectManaged(client, method.address, method.assembly);
+      const inspected = opts.provider === "corvus-android"
+        ? await inspectAndroid(client, method.address, methods)
+        : await inspectManaged(client, method.address, "assembly" in method ? method.assembly : undefined);
       entries.push({ address: method.address, name: method.name, ...inspected });
     }
     mkdirSync(dir, { recursive: true });

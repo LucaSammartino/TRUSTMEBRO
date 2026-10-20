@@ -167,7 +167,7 @@ async function callTool(name: string, args: Record<string, unknown>, state: { ta
       if (claim.task.kind === "review") throw new ToolError("Your current task is a check: use pool_verdict (agree, disagree or unsure).");
       const { shape, callees } = await runInspect(claim.task.address);
       const level = typeof confidence === "string" && ["low", "medium", "high"].includes(confidence) ? confidence : "low";
-      const common = { confidence: level, model: config.model ?? "unknown", agent: "rea-pool-mcp", evidence: [config.provider === "corvus-dotnet" ? "decompiled by Corvus" : "decompiled by Ghidra via rea"] };
+      const common = { confidence: level, model: config.model ?? "unknown", agent: "rea-pool-mcp", evidence: [config.provider ? "decompiled by Corvus" : "decompiled by Ghidra via rea"] };
       const notes = [{ kind: "function_name", value: fname, ...common }, { kind: "comment", value: summary, ...common }, ...parseExtras(args).map((d) => ({ ...d, ...common }))];
       const alternatives = cleanAlternatives(args.alternatives, fname);
       const { results } = await api<{ results: { status: string; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });

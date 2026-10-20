@@ -1,6 +1,7 @@
 // The built-in worker. It does two jobs:
 //   analyze: ask rea (Ghidra) for the decompiled function, ask an AI to name and describe it
 //   review:  ask rea for the same code, ask an AI whether someone else's name and description are right
+import { inspectAndroid, inspectAndroidSync } from "./android.ts";
 import { CorvusClient, inspectManaged, inspectManagedSync, type AnalysisProvider } from "./corvus.ts";
 import { spawn, spawnSync } from "node:child_process";
 import { runCommand, runCommandAsync, runUserCommand } from "./exec.ts";
@@ -134,6 +135,7 @@ export function inspectFunction(targetPath: string, address: string, provider?: 
   const cached = fromCache(targetPath, address, provider);
   if (cached) return cached;
   if (provider === "corvus-dotnet") return managedInspection(inspectManagedSync(targetPath, address));
+  if (provider === "corvus-android") return managedInspection(inspectAndroidSync(targetPath, address));
   const run = runCommand("rea", reaArgs(targetPath, address), { timeout: REA_TIMEOUT });
   if (run.error) throw new Error(`Could not start rea: ${run.error.message}`);
   if (run.status !== 0) throw new Error(`rea failed: ${(run.stderr ?? "").slice(0, 400)}`);
@@ -145,6 +147,7 @@ export async function inspectFunctionAsync(targetPath: string, address: string, 
   const cached = fromCache(targetPath, address, provider);
   if (cached) return cached;
   if (provider === "corvus-dotnet") return managedInspection(await inspectManaged(new CorvusClient(targetPath), address));
+  if (provider === "corvus-android") return managedInspection(await inspectAndroid(new CorvusClient(targetPath), address));
   const run = await runCommandAsync("rea", reaArgs(targetPath, address), { timeout: REA_TIMEOUT });
   if (run.error) throw new Error(`Could not start rea: ${run.error.message}`);
   if (run.status !== 0) throw new Error(`rea failed: ${(run.stderr ?? "").slice(0, 400)}`);
@@ -295,7 +298,7 @@ Use "agree" only if the proposal is clearly correct. Use "disagree" if it descri
 
 function notesFromAnswer(ctx: AgentContext, answer: { name?: string; summary?: string; confidence?: string }, details: Detail[] = []): object[] {
   const confidence = ["low", "medium", "high"].includes(String(answer.confidence)) ? answer.confidence : "low";
-  const common = { confidence, model: ctx.model, agent: "rea-pool", evidence: [ctx.provider === "corvus-dotnet" ? "decompiled by Corvus" : "decompiled by Ghidra via rea"] };
+  const common = { confidence, model: ctx.model, agent: "rea-pool", evidence: [ctx.provider ? "decompiled by Corvus" : "decompiled by Ghidra via rea"] };
   const notes: object[] = [];
   if (answer.name) notes.push({ kind: "function_name", value: answer.name, ...common });
   if (answer.summary) notes.push({ kind: "comment", value: answer.summary, ...common });

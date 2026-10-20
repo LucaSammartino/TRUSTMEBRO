@@ -1,3 +1,4 @@
+import { androidAddress } from "../src/android.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
@@ -12,11 +13,11 @@ import { runCommandAsync } from "../src/exec.ts";
 const leader = fileURLToPath(new URL("../src/leader.ts", import.meta.url));
 const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 
-test("leader and joined worker share the managed reader, and a missing reader gives a one-line fix", { skip: process.platform === "win32" }, async () => {
+for (const android of [false, true]) test(`leader and joined worker share the ${android ? "Android" : "managed"} reader, and a missing reader gives a one-line fix`, { skip: process.platform === "win32" }, async () => {
   const root = mkdtempSync(join(tmpdir(), "corvus-wire-"));
-  const fake = join(root, "corvus"), target = join(root, "game.dll"), data = join(root, "project");
+  const fake = join(root, "corvus"), target = join(root, android ? "classes.dex" : "game.dll"), data = join(root, "project");
   const b = Buffer.alloc(512); b.write("MZ"); b.writeUInt32LE(64, 60); b.write("PE\0\0", 64); b.writeUInt16LE(224, 84); b.writeUInt16LE(0x10b, 88);
-  b.writeUInt32LE(16, 88 + 92); b.writeUInt32LE(0x2000, 88 + 96 + 112); b.writeUInt32LE(72, 88 + 96 + 116); writeFileSync(target, b);
+  b.writeUInt32LE(16, 88 + 92); b.writeUInt32LE(0x2000, 88 + 96 + 112); b.writeUInt32LE(72, 88 + 96 + 116); writeFileSync(target, android ? Buffer.from("dex\n035\0") : b);
   // This is a mock executable, not Corvus. Every answer is fixed test data.
   writeFileSync(fake, `#!${process.execPath}
 const fs = require('node:fs');
@@ -25,11 +26,16 @@ if (process.env.MOCK_FAIL) process.exit(3);
 const steps = JSON.parse(fs.readFileSync(0, 'utf8'));
 for (let i=0;i<steps.length;i++) {
  const {tool,args}=steps[i]; let structured;
- if(tool==='search_symbols') structured={items:[{kind:'method',label:'Game.C::Tick()',assembly:'Game',token:'0x06000001'}],offset:0,total:1,hasMore:false,nextOffset:null};
+ if(tool==='search_symbols') structured={items:[{kind:'method',label:'Game.C::Tick()',assembly:'Game',token:process.env.MOCK_NEW_TOKEN || '0x06000001'}],offset:0,total:1,hasMore:false,nextOffset:null};
  else if(tool==='decompile_member') structured={language:'csharp',code:'int Tick() { return 42; }',offset:0,totalChars:25,nextOffset:null};
  else if(tool==='get_call_tree') structured={items:[],offset:0,total:0,hasMore:false,nextOffset:null};
  else if(tool==='get_assembly_info') structured={id:'Game'};
  else if(tool==='load_assembly') structured={ids:['fixture']};
+ else if(tool==='list_dex_classes') { if(process.argv.includes('--load')) process.exit(2); structured={items:[{descriptor:'Lsample/C;',dexFile:'classes.dex'}],offset:0,total:1}; }
+ else if(tool==='get_dex_class') structured={items:[{kind:'method',id:'Lsample/C;->tick()I'}],offset:0,total:1};
+ else if(tool==='decompile_java') structured={code:'int tick() { return 42; }',offset:0,totalChars:25,nextOffset:null};
+ else if(tool==='find_dex_references') structured={items:[],offset:0,total:0};
+ else if(tool==='find_counterpart') structured={items:[{kind:'method',oldToken:'0x06000001',newToken:'0x06000002',new:'New::Renamed()',how:'identical body (moved)',tier:'IL hash, other type',confidence:'strong'}],offset:0,total:1};
  else if(tool==='export_il2cpp_symbols') { fs.writeFileSync(require('node:path').join(args.outputDirectory,'pool_script.json'),JSON.stringify({ScriptMethod:[{Address:4096,Name:'Game.Player$$Tick'}]})); structured={functions:1,files:[]}; }
  else { console.error('unexpected mock tool '+tool); process.exit(2); }
  console.log(JSON.stringify({step:i+1,tool,isError:false,structured,error:null}));
@@ -57,11 +63,12 @@ for (let i=0;i<steps.length;i++) {
     const address = output.match(/http:\/\/127\.0\.0\.1:(\d+)(?=\s|$)/g)?.at(-1);
     assert.ok(address, output);
     const state = JSON.parse(readFileSync(join(data, "state.json"), "utf8"));
-    assert.equal(state.project.provider, "corvus-dotnet"); assert.equal(state.project.corvusVersion, "2.4.0"); assert.equal(state.tasks[0].address, "0x6000001");
+    const provider = android ? "corvus-android" : "corvus-dotnet";
+    assert.equal(state.project.provider, provider); assert.equal(state.project.corvusVersion, "2.4.0"); assert.equal(state.tasks[0].address, android ? androidAddress("Lsample/C;->tick()I") : "0x6000001");
     const run = (args: string[], extra = {}) => runCommandAsync(process.execPath, [cli, ...args], { env: { ...env, ...extra }, timeout: 15000 });
     const joined = await run(["join", address, state.joinCode, "--name", "alice", "--target", target]);
     assert.equal(joined.status, 0, joined.stdout + joined.stderr);
-    assert.equal(JSON.parse(readFileSync(env.REA_POOL_CONFIG, "utf8")).provider, "corvus-dotnet");
+    assert.equal(JSON.parse(readFileSync(env.REA_POOL_CONFIG, "utf8")).provider, provider);
     const prepared = await run(["prepare"]); assert.equal(prepared.status, 0, prepared.stdout + prepared.stderr);
     const next = await run(["next"]); assert.equal(next.status, 0, next.stdout + next.stderr); assert.match(JSON.parse(next.stdout).code, /return 42/);
     const submitted = await run(["submit", "--name", "game_tick", "--summary", "Computes the next tick.", "--confidence", "high"]);
@@ -70,7 +77,24 @@ for (let i=0;i<steps.length;i++) {
     assert.equal(missing.status, 2); assert.match(missing.stderr, /project needs Corvus.*setup.*setup-only/);
     const wrong = await run(["check"], { MOCK_VERSION: "2.3.0" }); assert.equal(wrong.status, 2); assert.match(wrong.stdout, /Corvus 2.4.0/);
     const applied = await runCommandAsync(process.execPath, [leader, "apply", "--data", data], { env });
-    assert.equal(applied.status, 1); assert.match(applied.stderr, /leader export/);
+    assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+    const names = JSON.parse(readFileSync(join(data, "apply", "names.json"), "utf8"));
+    assert.equal(names.functions[0].name, "game_tick");
+    if (android) assert.match(applied.stdout, /no documented Android rename/);
+    else {
+      const batch = JSON.parse(readFileSync(join(data, "apply", "corvus-batch.json"), "utf8"));
+      assert.equal(batch[1].tool, "rename_symbol"); assert.equal(batch[1].args.newName, "game_tick");
+      const exported = join(root, "results.json");
+      const saved = await runCommandAsync(process.execPath, [leader, "export", exported, "--best", "--data", data], { env });
+      assert.equal(saved.status, 0, saved.stdout + saved.stderr);
+      const newer = join(root, "new.dll"), newData = join(root, "new-project"), bytes = Buffer.from(b); bytes[500] = 1; writeFileSync(newer, bytes);
+      const imported = await runCommandAsync(process.execPath, [leader, "import-names", exported, target, newer, "--data", newData], { env: { ...env, MOCK_NEW_TOKEN: "0x06000002" } });
+      assert.equal(imported.status, 0, imported.stdout + imported.stderr);
+      const nextState = JSON.parse(readFileSync(join(newData, "state.json"), "utf8"));
+      assert.equal(nextState.project.provider, "corvus-dotnet"); assert.equal(nextState.tasks[0].address, "0x6000002");
+      assert.equal(nextState.notes.find((n: { kind: string }) => n.kind === "function_name").value, "game_tick");
+      assert.equal(nextState.notes[0].status, "trusted");
+    }
     const native = join(root, "GameAssembly.dll"), nativeData = join(root, "native");
     const bytes = Buffer.from(b); bytes.writeUInt32LE(0, 88 + 96 + 112); bytes.writeUInt32LE(0, 88 + 96 + 116); bytes.writeUInt32LE(0x400000, 88 + 28);
     writeFileSync(native, bytes); writeFileSync(join(root, "global-metadata.dat"), "fixture");

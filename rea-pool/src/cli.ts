@@ -372,7 +372,7 @@ async function main() {
         process.exit(1);
       }
       const config: Config = { leaderUrl: url, token: data.token, name: data.name, ...(data.project.provider ? { provider: data.project.provider } : {}) };
-      const needsCorvus = data.project.provider === "corvus-dotnet";
+      const needsCorvus = !!data.project.provider;
       if (flags.target && flags.target !== "true") {
         if (!existsSync(flags.target)) {
           console.error(`Joined, but the file ${flags.target} was not found. Set it later with: pool set-target <path>`);
@@ -500,7 +500,7 @@ async function main() {
       }
       const { shape, callees } = inspectFunction(config.targetPath!, claim.task.address, config.provider);
       const level = ["low", "medium", "high"].includes(confidence) ? confidence : "low";
-      const common = { confidence: level, model: flags.model ?? config.model ?? "unknown", agent: "rea-pool-skill", evidence: [config.provider === "corvus-dotnet" ? "decompiled by Corvus" : "decompiled by Ghidra via rea"] };
+      const common = { confidence: level, model: flags.model ?? config.model ?? "unknown", agent: "rea-pool-skill", evidence: [config.provider ? "decompiled by Corvus" : "decompiled by Ghidra via rea"] };
       const notes = [{ kind: "function_name", value: name, ...common }, { kind: "comment", value: summary, ...common }, ...detailsFromFlags(flags).map((d) => ({ ...d, ...common }))];
       const alternatives = flags.alt && flags.alt !== "true" ? cleanAlternatives(flags.alt.split(","), name) : [];
       const sub = await submitOrQueue<{ results: { status: NoteStatus; reason?: string }[] }>(config, { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });

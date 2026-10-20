@@ -1,3 +1,5 @@
+import { androidAddress, inspectAndroid, inspectAndroidSync, listAndroidMethods } from "../src/android.ts";
+import { writeCorvusApplyBundle } from "../src/apply.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -8,7 +10,7 @@ import { CorvusClient, CORVUS_VERSION, corvusAvailable, detectTargetKind, il2cpp
 import { inspectFunction, inspectFunctionAsync, markCorvusNames, fillCalleesFromDump } from "../src/agent.ts";
 import { buildAnalyzeCommand, cachedImageBase, cachePathFor, clearDumpMemo, loadDump, prepareTarget, sha256FileSync } from "../src/prepare.ts";
 import { runAllChecks } from "../src/check.ts";
-import { parseMigratedNames, trustedBuildNames, migrateBuildNames } from "../src/import-names.ts";
+import { parseMigratedNames, parseManagedMatches, trustedBuildNames, migrateBuildNames, migrateManagedNames } from "../src/import-names.ts";
 import { runCommand } from "../src/exec.ts";
 
 function fixture(t: { after: (fn: () => void) => void }) {
@@ -210,4 +212,138 @@ test("optional Ghidra base metadata is used for rebased Il2Cpp libraries", async
   const base = { ghidraDir: "/g", projectDir: "/p", targetPath: "/t", scriptDir: "/s", outFile: "/out" };
   assert.deepEqual(buildAnalyzeCommand(base).args.slice(-2), ["/out", "-deleteProject"]);
   assert.deepEqual(buildAnalyzeCommand({ ...base, imageBaseFile: "/base.json" }).args.slice(-3), ["/out", "/base.json", "-deleteProject"]);
+});
+
+
+function zipEntries(names: string[]): Buffer {
+  const local: Buffer[] = [], central: Buffer[] = [];
+  let offset = 0;
+  for (const name of names) {
+    const text = Buffer.from(name), header = Buffer.alloc(30), entry = Buffer.alloc(46);
+    header.writeUInt32LE(0x04034b50); header.writeUInt16LE(text.length, 26);
+    entry.writeUInt32LE(0x02014b50); entry.writeUInt16LE(text.length, 28); entry.writeUInt32LE(offset, 42);
+    local.push(header, text); central.push(entry, text); offset += header.length + text.length;
+  }
+  const directory = Buffer.concat(central), end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50); end.writeUInt16LE(names.length, 8); end.writeUInt16LE(names.length, 10);
+  end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...local, directory, end]);
+}
+const dexA = "Lsample/A;->first(I)V", dexB = "Lsample/B;->second()V";
+function androidAnswer(step: CorvusStep): unknown {
+  const { tool, args } = step;
+  if (tool === "list_dex_classes") return args.offset ? page([{ descriptor: "Lsample/B;", dexFile: "classes2.dex" }], 1, 2) : page([{ descriptor: "Lsample/A;", dexFile: "classes.dex" }], 0, 2);
+  if (tool === "get_dex_class") { assert.equal(args.members, "methods"); return page([{ kind: "method", id: args.class === "Lsample/A;" ? dexA : dexB }]); }
+  if (tool === "decompile_java") {
+    assert.equal(args.javaOnly, undefined);
+    return { code: args.offset ? "void" : ".method ", offset: args.offset ?? 0, totalChars: 12, nextOffset: args.offset ? null : 8 };
+  }
+  if (tool === "find_dex_references") {
+    assert.equal(args.direction, "from"); assert.equal(args.kind, "method");
+    return args.offset ? page([{ kind: "call", method: args.target, target: "Ljava/lang/Object;->toString()Ljava/lang/String;" }], 1, 2) : page([{ kind: "call", method: args.target, target: dexB }], 0, 2);
+  }
+  throw new Error(`Unexpected Android mock step ${tool}`);
+}
+
+test("Android detection reads DEX magic and ZIP entries, and requires its reader", (t) => {
+  const root = fixture(t), target = join(root, "renamed.bin");
+  for (const bytes of [Buffer.from("dex\n035\0"), zipEntries(["classes.dex", "classes2.dex"]), zipEntries(["AndroidManifest.xml"])]) {
+    writeFileSync(target, bytes); assert.equal(detectTargetKind(target), "android"); assert.equal(selectProvider(target), "corvus-android");
+    assert.throws(() => selectProvider(target, true), /Android projects need Corvus/);
+  }
+  for (const bytes of [Buffer.from("dex\nxxx\0"), zipEntries(["assets/classes.dex"]), zipEntries(["lib/arm64-v8a/libgame.so"]), zipEntries(["classes.dex"]).subarray(0, 35)]) {
+    writeFileSync(target, bytes); assert.equal(detectTargetKind(target), "native");
+  }
+  writeFileSync(target, Buffer.from("dex\n041\0")); process.env.CORVUS_BIN = join(root, "missing");
+  assert.throws(() => selectProvider(target), /setup.*setup-only/);
+});
+
+test("Android listing, Java or smali and calls use exact local method ids across DEX files", async (t) => {
+  const root = fixture(t), target = join(root, "app.apk"); writeFileSync(target, zipEntries(["classes.dex", "classes2.dex"]));
+  const seen: CorvusStep[] = [], c = client(target, androidAnswer, seen);
+  assert.equal(c.loadTarget, false);
+  const listed = await listAndroidMethods(c);
+  assert.deepEqual(listed, [{ address: androidAddress(dexA), name: dexA }, { address: androidAddress(dexB), name: dexB }]);
+  const got = await inspectAndroid(c, androidAddress(dexA));
+  assert.deepEqual(got, { code: ".method void", callees: [androidAddress(dexB)] });
+  const syncRunner = ((_program, args, options) => {
+    assert.equal(args.includes("--load"), false);
+    return { ...output(JSON.parse(options!.input!), androidAnswer), pid: 0, signal: null, output: [] };
+  }) as typeof runCommand;
+  assert.deepEqual(inspectAndroidSync(target, androidAddress(dexA), syncRunner), got);
+  await assert.rejects(listAndroidMethods(client(target, (s) => s.tool === "list_dex_classes" ? page([{ descriptor: "Lsample/A;" }, { descriptor: "Lsample/A;" }]) : androidAnswer(s))), /unexpected Android/);
+  await assert.rejects(listAndroidMethods(client(target, (s) => s.tool === "get_dex_class" ? page([{ kind: "method", id: "instructions" }]) : androidAnswer(s))), /unexpected Android/);
+  await assert.rejects(inspectAndroid(client(target, (s) => s.tool === "decompile_java" ? { code: "partial", offset: 0, totalChars: 10 } : androidAnswer(s)), androidAddress(dexA)), /unexpected Android/);
+  await assert.rejects(inspectAndroid(client(target, (s) => s.tool === "find_dex_references" ? page([{ kind: "call", method: dexB, target: dexA }]) : androidAnswer(s)), androidAddress(dexA)), /unexpected Android/);
+  await assert.rejects(inspectAndroid(c, "0x1"), /not in your copy/);
+  const fallbackAnswer = (s: CorvusStep) => {
+    if (s.tool === "disassemble_dex") { assert.equal(s.args.format, "smali"); return androidAnswer({ ...s, tool: "decompile_java" }); }
+    return androidAnswer(s);
+  };
+  const fallbackRunner: CorvusRunner = async (_program, _args, options) => {
+    const steps: CorvusStep[] = JSON.parse(options!.input!);
+    return steps[0].tool === "decompile_java" ? { status: 3, stderr: "JADX unavailable", stdout: "" } : output(steps, fallbackAnswer);
+  };
+  assert.deepEqual(await inspectAndroid(new CorvusClient(target, fallbackRunner), androidAddress(dexA)), got);
+  const syncFallback = ((_program, _args, options) => {
+    const steps: CorvusStep[] = JSON.parse(options!.input!);
+    return { ...(steps[0].tool === "decompile_java" ? { status: 3, stderr: "JADX unavailable", stdout: "" } : output(steps, fallbackAnswer)), pid: 0, signal: null, output: [] };
+  }) as typeof runCommand;
+  assert.deepEqual(inspectAndroidSync(target, androidAddress(dexA), syncFallback), got);
+});
+
+test("Android caches are separate and provide sync/async inspection without a reader", async (t) => {
+  const root = fixture(t), target = join(root, "classes.dex"); writeFileSync(target, "dex\n035\0");
+  const prepared = await prepareTarget(target, { provider: "corvus-android", corvus: client(target, androidAnswer) });
+  assert.equal(prepared.functions, 2);
+  assert.notEqual(cachePathFor(target, "corvus-android").dir, cachePathFor(target, "corvus-dotnet").dir);
+  assert.equal(loadDump(target), null);
+  process.env.CORVUS_BIN = join(root, "missing");
+  assert.equal((await prepareTarget(target, { provider: "corvus-android" })).fromCache, true);
+  assert.deepEqual(inspectFunction(target, androidAddress(dexA), "corvus-android").callees, [androidAddress(dexB)]);
+  assert.match((await inspectFunctionAsync(target, androidAddress(dexA), "corvus-android")).code, /method void/);
+  const required = await runAllChecks({ target: { filename: "classes.dex", sha256: sha256FileSync(target) }, tools: [], provider: "corvus-android", corvusVersion: CORVUS_VERSION } as unknown as State["project"], target);
+  assert.equal(required[1].status, "fail"); assert.match(required[1].message, /setup.*setup-only/);
+});
+
+const managedMatch = (oldToken = "0x06000001", newToken = "0x06000002") => ({ kind: "method", oldToken, newToken, old: "Old::M()", new: "New::Moved()", how: "identical body (moved)", tier: "IL hash, other type", confidence: "strong" });
+test("managed carry-over previews paged groups of at most 100 and rejects weak or ambiguous matches", async (t) => {
+  const root = fixture(t), trusted = [{ address: "0x6000001", name: "tick" }], row = managedMatch();
+  assert.deepEqual(parseManagedMatches([row], trusted), [{ oldAddress: "0x6000001", address: "0x6000002", name: "tick" }]);
+  for (const changed of [{ confidence: "structural" }, { candidates: ["other"] }, { how: "ambiguous" }, { tier: "name" }, { newToken: null }, { confidence: 0.99 }]) assert.deepEqual(parseManagedMatches([{ ...row, ...changed }], trusted), []);
+  for (const changed of [{ oldToken: "0x06000003" }, { newToken: "0x02000001" }, { candidates: "guess" }]) assert.throws(() => parseManagedMatches([{ ...row, ...changed }], trusted), /Corvus/);
+  assert.throws(() => parseManagedMatches([row, row], trusted), /unexpected managed method/);
+  assert.throws(() => parseManagedMatches([row], [{ ...trusted[0], name: "bash" }]), /unverified/);
+  const many = Array.from({ length: 101 }, (_, n) => ({ address: `0x${(0x6000001 + n).toString(16)}`, name: `method_${n}` }));
+  const seen: CorvusStep[] = [];
+  const result = await migrateManagedNames(join(root, "old.dll"), join(root, "new.dll"), many, client("old.dll", (s) => {
+    if (s.tool === "load_assembly") return {};
+    assert.equal(s.tool, "find_counterpart");
+    const symbols = s.args.symbols as string[], offset = s.args.offset as number;
+    assert.ok(symbols.length <= 100);
+    const subset = symbols.slice(offset, offset + 40);
+    return page(subset.map((token) => managedMatch(token, `0x${(parseInt(token.slice(2), 16) + 200).toString(16).padStart(8, "0")}`)), offset, symbols.length);
+  }, seen));
+  assert.equal(result.length, 101); assert.equal(seen.filter((s) => s.tool === "find_counterpart").length, 4);
+  assert.equal(seen.some((s) => /rename|save|migrate_native/.test(s.tool)), false);
+  assert.throws(() => parseManagedMatches([row, managedMatch("0x06000003")], [...trusted, { address: "0x6000003", name: "tock" }]), /unverified/);
+  await assert.rejects(migrateManagedNames("old", "new", trusted, client("old", (s) => s.tool === "load_assembly" ? {} : page([]))), /requested method list/);
+});
+
+test("managed apply writes a checked Corvus batch, notes and a separate copy without running it", (t) => {
+  const root = fixture(t), target = join(root, "file-name.dll"), out = join(root, "out"); writeFileSync(target, pe());
+  const state = { project: { name: "sample", target: { filename: "file-name.dll", sha256: sha256FileSync(target) }, provider: "corvus-dotnet", corvusVersion: CORVUS_VERSION, rules: { maxTextLength: 500 } }, tasks: [{ id: "fn-0x6000001", address: "0x6000001" }], notes: [{ taskId: "fn-0x6000001", kind: "function_name", status: "trusted", value: "tick", confidence: "high", at: "2026-01-01" }, { taskId: "fn-0x6000001", kind: "comment", status: "trusted", value: "Advances the timer.", confidence: "high", at: "2026-01-01" }], proposals: [] } as unknown as State;
+  const before = readFileSync(target);
+  const result = writeCorvusApplyBundle(state, out, target), steps = JSON.parse(readFileSync(result.batchFile!, "utf8"));
+  assert.equal(result.count, 1); assert.deepEqual(readFileSync(target), before);
+  assert.deepEqual(steps.map((s: CorvusStep) => s.tool), ["load_assembly", "rename_symbol", "record_note", "save_assembly", "save_session"]);
+  assert.deepEqual(steps[1].args, { assembly: target, symbol: "0x06000001", kind: "method", newName: "tick", dryRun: false });
+  assert.equal(steps[2].args.anchor, `${target}:0x06000001`);
+  assert.equal(steps[3].args.outputPath, join(out, "file-name.renamed.dll")); assert.equal(steps[3].args.overwrite, false);
+  assert.equal(steps[4].args.overwrite, false);
+  assert.throws(() => writeCorvusApplyBundle(state, out), /--target/);
+  state.notes[0].value = "bash"; assert.throws(() => writeCorvusApplyBundle(state, out, target), /unusable/); state.notes[0].value = "tick";
+  writeFileSync(target, pe(false, false)); assert.throws(() => writeCorvusApplyBundle(state, out, target), /fingerprint/);
+  state.project.provider = "corvus-android";
+  assert.equal(writeCorvusApplyBundle(state, join(root, "android")).batchFile, undefined);
 });

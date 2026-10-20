@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Leader tool. One command does the setup:  leader start <software-file>
+import { listAndroidMethods } from "./android.ts";
 import { CorvusClient, CORVUS_VERSION, listManagedMethods, selectProvider } from "./corvus.ts";
 import { randomBytes } from "node:crypto";
 import { runCommand, runCommandAsync } from "./exec.ts";
@@ -8,7 +9,7 @@ import { cachedImageBase, loadDump, prepareTarget } from "./prepare.ts";
 import { addCallees, calleesFromReaFunction, graphStats, normalizeAddress } from "./graph.ts";
 import { isShape, shapeOf } from "./similar.ts";
 import { existsSync, mkdirSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { networkInterfaces } from "node:os";
 import type { Note, Project, State, Task, ToolSpec } from "./types.ts";
 import { createInvite, createPoolServer, listInvites, loadState, overrideNote, revokeInvite, saveState, submitAnalysis } from "./server.ts";
@@ -78,7 +79,7 @@ function usage(): never {
                                       parallel). Safe to stop with Ctrl+C and run again to continue.
                                       Functions Ghidra already named (not FUN_...) are skipped;
                                       --keep-named turns that off (for programs that still have symbols)
-  apply [out-dir]                     Write the trusted names for Ghidra (default ./pool-data/apply)
+  apply [out-dir] [--target <file>]  Write trusted names for the project's reader (default ./pool-data/apply)
   revoke <person>                     Cancel someone's access
   approve <note-id> | reject <note-id>
                                       Optional overrides. You never need these.
@@ -89,7 +90,7 @@ function usage(): never {
   export-state [file]                 Copy the whole project (default ./pool-export.json) to hand the leader job
                                       to someone else. Contains everyone's access: give it only to someone you trust
   import-names <results.json> <old-file> <new-file> --data <new-folder>
-                                      Carry trusted names to a new native game build with Corvus
+                                      Carry trusted names to a new native or .NET build with Corvus
   import-state <file> [--force]       New leader: load an exported project into the data folder, then run start.
                                       Everyone then runs  pool set-leader <new address>
   retry-models <label,label|none>    Model labels that get retries first (none clears)
@@ -145,6 +146,7 @@ async function createProject(file: string, dataDir: string, name: string | undef
       throw new Error(`This game needs Corvus ${CORVUS_VERSION}. Run: ${CORVUS_FIX}`);
     }
   }
+  if (provider) writeJsonAtomic(join(dataDir, "corvus-target.json"), { path: resolve(file) });
   const project: Project = {
     schema: "rea-pool/1",
     name: name ?? basename(file),
@@ -238,7 +240,7 @@ async function importGameNames(file: string, statePath: string, flags: Record<st
 
 async function buildGraph(file: string, dataDir: string, statePath: string, flags: Record<string, string>): Promise<void> {
   const project = loadState(statePath).project;
-  if (project.provider === "corvus-dotnet") {
+  if (project.provider) {
     if (await sha256File(file) !== project.target.sha256) throw new Error("This file does not match the project. Use the same game build.");
     await prepareTarget(file, { provider: project.provider, log: console.log });
     const fresh = loadState(statePath);
@@ -417,8 +419,8 @@ async function main() {
       console.log("Contributors must have:");
       if (state.project.provider) console.log(`  - Corvus ${state.project.corvusVersion}`);
       for (const t of state.project.tools) console.log(`  - ${t.name} ${t.required}`);
-      const incoming = state.project.provider === "corvus-dotnet"
-        ? (await listManagedMethods(new CorvusClient(file))).map((m) => ({ id: `fn-${m.address}`, address: m.address, label: `Method at ${m.address}` }))
+      const incoming = state.project.provider
+        ? (await (state.project.provider === "corvus-android" ? listAndroidMethods : listManagedMethods)(new CorvusClient(file))).map((m) => ({ id: `fn-${m.address}`, address: m.address, label: `Method at ${m.address}` }))
         : listFunctions(file);
       const added = addTasks(state, incoming);
       saveState(statePath, state);
@@ -590,8 +592,18 @@ async function main() {
     }
     case "apply": {
       const state = needState();
-      if (state.project.provider === "corvus-dotnet") throw new Error("For a .NET game, save names with leader export results.json --best. Applying .NET names is not connected yet; Ghidra apply is for native code.");
       const outDir = rest[0] ?? join(dataDir, "apply");
+      if (state.project.provider) {
+        const { writeCorvusApplyBundle } = await import("./apply.ts");
+        const local = join(dataDir, "corvus-target.json");
+        const target = flags.target ?? (existsSync(local) ? readJson<{ path?: string }>(local).path : undefined);
+        const r = writeCorvusApplyBundle(state, outDir, target);
+        console.log(`Wrote ${r.count} checked names to ${r.namesFile}.`);
+        if (r.batchFile) console.log(`To write a renamed copy, run: corvus batch "${r.batchFile}" --stop-on-error --no-index
+The new assembly will be ${r.outputFile}. The original is kept. Comments are saved as Corvus notes and in ${r.sessionFile}.`);
+        else console.log("Corvus 2.4.0 has no documented Android rename/save tool. Keep names.json as your name list; the APK or DEX has not been changed.");
+        break;
+      }
       let writeApplyBundle: (s: State, dir: string) => { namesFile: string; scriptFile: string; count: number };
       try {
         ({ writeApplyBundle } = await import("./apply.ts"));
@@ -640,12 +652,18 @@ async function main() {
       if (existsSync(statePath)) throw new Error("Choose an empty project folder with --data. Your existing project will be kept.");
       const { detectTargetKind, corvusAvailable, CORVUS_FIX } = await import("./corvus.ts");
       if (!corvusAvailable()) throw new Error(`Name carry-over needs Corvus. Run: ${CORVUS_FIX}`);
-      if (detectTargetKind(oldFile) === "dotnet" || detectTargetKind(newFile) === "dotnet") throw new Error("Name carry-over currently supports native game builds, including Il2Cpp. Managed build matching is not connected yet.");
-      const { trustedBuildNames, migrateBuildNames } = await import("./import-names.ts");
+      const oldKind = detectTargetKind(oldFile), newKind = detectTargetKind(newFile);
+      if (oldKind === "android" || newKind === "android") throw new Error("Android name carry-over is not supported yet. Keep the exported names for reference.");
+      const managed = oldKind === "dotnet" && newKind === "dotnet";
+      if ((oldKind === "dotnet" || newKind === "dotnet") && !managed) throw new Error("Both builds must use the same kind of code (.NET or native).");
+      const { trustedBuildNames, migrateBuildNames, migrateManagedNames } = await import("./import-names.ts");
       const trusted = trustedBuildNames(readJson(resultsFile), await sha256File(oldFile));
-      const mapped = await migrateBuildNames(oldFile, newFile, trusted);
-      const state = await createProject(newFile, dataDir, flags.name && flags.name !== "true" ? flags.name : undefined, true);
-      addTasks(state, listFunctions(newFile));
+      const managedState = managed ? await createProject(newFile, dataDir, flags.name && flags.name !== "true" ? flags.name : undefined) : undefined;
+      const mapped = await (managed ? migrateManagedNames : migrateBuildNames)(oldFile, newFile, trusted);
+      const state = managedState ?? await createProject(newFile, dataDir, flags.name && flags.name !== "true" ? flags.name : undefined, true);
+      addTasks(state, managed
+        ? (await listManagedMethods(new CorvusClient(newFile))).map((m) => ({ id: `fn-${m.address}`, address: m.address, label: `Method at ${m.address}` }))
+        : listFunctions(newFile));
       const byAddress = new Map(state.tasks.map((t) => [normalizeAddress(t.address), t]));
       let seeded = 0;
       for (const name of mapped) {
@@ -655,7 +673,7 @@ async function main() {
         if (accepted.some((r) => r.ok)) seeded++;
       }
       saveState(statePath, state);
-      console.log(`Created the new project with ${seeded} trusted names carried over. Run leader start --data "${dataDir}" to share it, or leader apply --data "${dataDir}" to write the names for Ghidra.`);
+      console.log(`Created the new project with ${seeded} trusted names carried over. Run leader start --data "${dataDir}" to share it, or leader apply --data "${dataDir}" to write the names for its reader.`);
       break;
     }
     case "import-state": {
