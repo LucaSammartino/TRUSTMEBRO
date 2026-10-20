@@ -1,8 +1,9 @@
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CorvusClient, CORVUS_VERSION, corvusAvailable, detectTargetKind, inspectManaged, listManagedMethods, type AnalysisProvider } from "./corvus.ts";
 import { runCommandAsync } from "./exec.ts";
 import { normalizeAddress } from "./graph.ts";
 import { writeJsonAtomic } from "./util.ts";
@@ -47,8 +48,8 @@ function hashOf(targetPath: string): string {
   return h;
 }
 
-export function cachePathFor(targetPath: string): { dir: string; dumpFile: string; metaFile: string } {
-  const dir = join(cacheRoot(), hashOf(targetPath));
+export function cachePathFor(targetPath: string, provider?: AnalysisProvider): { dir: string; dumpFile: string; metaFile: string } {
+  const dir = provider ? join(cacheRoot(), hashOf(targetPath), `${provider}-${CORVUS_VERSION}`) : join(cacheRoot(), hashOf(targetPath));
   return { dir, dumpFile: join(dir, "dump.jsonl"), metaFile: join(dir, "meta.json") };
 }
 
@@ -59,18 +60,21 @@ export function buildAnalyzeCommand(o: {
   scriptDir: string;
   outFile: string;
   platform?: NodeJS.Platform;
+  imageBaseFile?: string;
 }): { program: string; args: string[] } {
   const win = (o.platform ?? process.platform) === "win32";
   const program = win ? join(o.ghidraDir, "support", "analyzeHeadless.bat") : join(o.ghidraDir, "support", "analyzeHeadless");
   const args = [o.projectDir, "dump", "-import", o.targetPath, "-scriptPath", o.scriptDir, "-postScript", "DumpAll.java", o.outFile, "-deleteProject"];
+  if (o.imageBaseFile) args.splice(args.indexOf("-deleteProject"), 0, o.imageBaseFile);
   return { program, args };
 }
 
-function validMeta(targetPath: string, metaFile: string, dumpFile: string): boolean {
+function validMeta(targetPath: string, metaFile: string, dumpFile: string, provider?: AnalysisProvider): boolean {
   try {
     if (!existsSync(dumpFile) || !existsSync(metaFile)) return false;
     const meta = JSON.parse(readFileSync(metaFile, "utf8"));
-    return typeof meta?.sha256 === "string" && meta.sha256 === hashOf(targetPath);
+    return typeof meta?.sha256 === "string" && meta.sha256 === hashOf(targetPath) &&
+      (!provider || (meta.provider === provider && meta.corvus === CORVUS_VERSION));
   } catch {
     return false;
   }
@@ -93,14 +97,34 @@ function lastLine(text: string): string {
 
 export async function prepareTarget(
   targetPath: string,
-  opts: { force?: boolean; log?: (m: string) => void } = {},
+  opts: { force?: boolean; log?: (m: string) => void; provider?: AnalysisProvider; corvus?: CorvusClient; noCorvus?: boolean } = {},
 ): Promise<{ dumpFile: string; functions: number; seconds: number; fromCache: boolean }> {
   const log = opts.log ?? (() => {});
   if (!existsSync(targetPath)) throw new Error(`The file to analyze was not found: ${targetPath}`);
   const sha = hashOf(targetPath);
-  const { dir, dumpFile, metaFile } = cachePathFor(targetPath);
-  if (!opts.force && validMeta(targetPath, metaFile, dumpFile)) {
+  const { dir, dumpFile, metaFile } = cachePathFor(targetPath, opts.provider);
+  if (!opts.force && validMeta(targetPath, metaFile, dumpFile, opts.provider)) {
     return { dumpFile, functions: metaFunctions(metaFile), seconds: 0, fromCache: true };
+  }
+  if (opts.provider === "corvus-dotnet") {
+    const started = Date.now();
+    const client = opts.corvus ?? new CorvusClient(targetPath);
+    log("Reading the game's methods with Corvus...");
+    const methods = await listManagedMethods(client);
+    const entries: DumpEntry[] = [];
+    for (const method of methods) {
+      const inspected = await inspectManaged(client, method.address, method.assembly);
+      entries.push({ address: method.address, name: method.name, ...inspected });
+    }
+    mkdirSync(dir, { recursive: true });
+    const tmp = `${dumpFile}.tmp`;
+    try {
+      writeFileSync(tmp, entries.map((e) => JSON.stringify(e)).join("\n") + "\n", { mode: 0o600 });
+      renameSync(tmp, dumpFile);
+      writeJsonAtomic(metaFile, { sha256: sha, functions: entries.length, createdAt: new Date().toISOString(), provider: opts.provider, corvus: CORVUS_VERSION });
+    } finally { rmSync(tmp, { force: true }); }
+    memo.delete(`${resolve(targetPath)}|${opts.provider}`);
+    return { dumpFile, functions: entries.length, seconds: Math.round((Date.now() - started) / 100) / 10, fromCache: false };
   }
   const ghidraDir = process.env.GHIDRA_INSTALL_DIR;
   if (!ghidraDir || !existsSync(join(ghidraDir, "support"))) {
@@ -113,7 +137,8 @@ export async function prepareTarget(
   try {
     rmSync(tmpFile, { force: true });
     const scriptDir = join(dirname(fileURLToPath(import.meta.url)), "..", "ghidra");
-    const cmd = buildAnalyzeCommand({ ghidraDir, projectDir, targetPath: resolve(targetPath), scriptDir, outFile: tmpFile });
+    const imageBaseFile = !opts.noCorvus && corvusAvailable() && detectTargetKind(targetPath) === "il2cpp" ? join(projectDir, "image-base.json") : undefined;
+    const cmd = buildAnalyzeCommand({ ghidraDir, projectDir, targetPath: resolve(targetPath), scriptDir, outFile: tmpFile, imageBaseFile });
     log("Dumping all functions with Ghidra (this can take a few minutes)...");
     const res = await runCommandAsync(cmd.program, cmd.args, { timeout: 30 * 60_000, maxBuffer: 256 * 1024 * 1024 });
     const output = `${res.stdout}\n${res.stderr}`;
@@ -134,7 +159,11 @@ export async function prepareTarget(
       if (!ok) throw new Error("Ghidra produced a damaged function dump (a line is not valid).");
     }
     renameSync(tmpFile, dumpFile);
-    writeJsonAtomic(metaFile, { sha256: sha, functions: lines.length, createdAt: new Date().toISOString(), ghidra: basename(ghidraDir) });
+    let imageBase: string | null = null;
+    try {
+      if (imageBaseFile) imageBase = normalizeAddress(JSON.parse(readFileSync(imageBaseFile, "utf8")).imageBase);
+    } catch { /* Optional address metadata; the normal dump remains usable. */ }
+    writeJsonAtomic(metaFile, { sha256: sha, functions: lines.length, createdAt: new Date().toISOString(), ghidra: basename(ghidraDir), ...(imageBase ? { imageBase } : {}) });
     memo.delete(resolve(targetPath));
     const seconds = Math.round((Date.now() - started) / 100) / 10;
     log(`Dumped ${lines.length} functions in ${seconds}s.`);
@@ -150,14 +179,14 @@ export function clearDumpMemo(): void {
   hashMemo.clear();
 }
 
-export function loadDump(targetPath: string): Map<string, DumpEntry> | null {
-  const key = resolve(targetPath);
+export function loadDump(targetPath: string, provider?: AnalysisProvider): Map<string, DumpEntry> | null {
+  const key = provider ? `${resolve(targetPath)}|${provider}` : resolve(targetPath);
   const hit = memo.get(key);
   if (hit) return hit;
   let paths;
   try {
-    paths = cachePathFor(targetPath);
-    if (!validMeta(targetPath, paths.metaFile, paths.dumpFile)) return null;
+    paths = cachePathFor(targetPath, provider);
+    if (!validMeta(targetPath, paths.metaFile, paths.dumpFile, provider)) return null;
   } catch {
     return null;
   }
@@ -178,8 +207,18 @@ export function loadDump(targetPath: string): Map<string, DumpEntry> | null {
   return map;
 }
 
-export function lookupFunction(targetPath: string, address: string): DumpEntry | null {
+export function lookupFunction(targetPath: string, address: string, provider?: AnalysisProvider): DumpEntry | null {
   const a = normalizeAddress(address);
   if (!a) return null;
-  return loadDump(targetPath)?.get(a) ?? null;
+  return loadDump(targetPath, provider)?.get(a) ?? null;
+}
+
+/** Ghidra may rebase an ELF library. Use its actual base when importing RVA-based metadata. */
+export function cachedImageBase(targetPath: string): bigint | null {
+  try {
+    const paths = cachePathFor(targetPath);
+    if (!validMeta(targetPath, paths.metaFile, paths.dumpFile)) return null;
+    const base = normalizeAddress(JSON.parse(readFileSync(paths.metaFile, "utf8")).imageBase);
+    return base ? BigInt(base) : null;
+  } catch { return null; }
 }

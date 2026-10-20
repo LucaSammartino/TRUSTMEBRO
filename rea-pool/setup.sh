@@ -7,6 +7,7 @@
 #   ./setup.sh --mode setup-only    just set up (for the leader)
 #   ./setup.sh --check-only         only report what is missing; install nothing and ask nothing
 #   ./setup.sh --yes                do not ask, just install what is missing
+#   ./setup.sh --no-corvus          skip the optional game reader
 #   ./setup.sh --ignore-existing    pretend nothing is installed (for testing the installer)
 #
 # Works with the bash that ships with macOS (3.2).
@@ -18,12 +19,14 @@ MODE="friend"
 CHECK_ONLY=0
 ASSUME_YES=0
 IGNORE_EXISTING=0
+NO_CORVUS=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode) MODE="${2:-friend}"; shift 2 ;;
     --check-only) CHECK_ONLY=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
+    --no-corvus) NO_CORVUS=1; shift ;;
     --ignore-existing) IGNORE_EXISTING=1; shift ;;
     -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1 (try --help)"; exit 2 ;;
@@ -271,6 +274,51 @@ ensure_rea() {
   else bad "rea is required."; fi
 }
 
+# ---- Corvus (optional) -------------------------------------------------------------------------
+
+corvus_version() { "$1" --version 2>/dev/null | sed -n 's/.*\([0-9]\{1,\}\.[0-9]\{1,\}\.[0-9]\{1,\}\).*/\1/p' | head -n 1; }
+
+ensure_corvus() {
+  [ "$NO_CORVUS" -eq 1 ] && return
+  say "Corvus (extra reader for Unity/.NET games)"
+  local dir="$TOOLS/corvus" key asset sum version
+  version="$(req corvusVersion)"
+  if [ "$IGNORE_EXISTING" -eq 0 ] && have corvus && [ "$(corvus_version corvus)" = "$version" ]; then ok "Corvus $version (optional) found"; return; fi
+  if [ -x "$dir/corvus" ] && [ "$(corvus_version "$dir/corvus")" = "$version" ]; then
+    NEW_PATH="$dir:$NEW_PATH"; export PATH="$dir:$PATH"; ok "Corvus (optional) found"; return
+  fi
+  if [ "$CHECK_ONLY" -eq 1 ]; then say "  Optional reader not installed; rea/Ghidra still works."; return; fi
+  ask "Install Corvus (extra reader for Unity/.NET games)?" || return
+  case "$OSN-$ARCHN" in
+    linux-x64) key=LinuxX64 ;; linux-arm64) key=LinuxArm64 ;;
+    darwin-x64) key=OsxX64 ;; darwin-arm64) key=OsxArm64 ;;
+  esac
+  asset="$(req "corvus${key}Asset")"; sum="$(req "corvus${key}Sha256")"; version="$(req corvusVersion)"
+  # Do not use download(): optional failures must never add to PROBLEMS.
+  if ! have curl || ! curl -fL --retry 3 --silent --show-error -o "$TMP/corvus-archive" "https://github.com/Albasha0x0/Corvus/releases/download/v$version/$asset"; then
+    say "  [WARNING] Corvus could not be downloaded; continuing with rea/Ghidra."; return
+  fi
+  if [ -z "$sum" ] || [ "$(sha256_of "$TMP/corvus-archive")" != "$sum" ]; then
+    rm -f "$TMP/corvus-archive"
+    say "  [WARNING] Corvus fingerprint did not match; it was NOT unpacked or installed. Continuing with rea/Ghidra."; return
+  fi
+  if ! mkdir -p "$TMP/corvus-unpack" || ! tar -xzf "$TMP/corvus-archive" -C "$TMP/corvus-unpack" || [ ! -f "$TMP/corvus-unpack/corvus" ]; then
+    say "  [WARNING] Corvus could not be unpacked; continuing with rea/Ghidra."; return
+  fi
+  if ! chmod +x "$TMP/corvus-unpack/corvus" || ! mkdir -p "$TOOLS"; then
+    say "  [WARNING] Corvus could not be installed; continuing with rea/Ghidra."; return
+  fi
+  if [ -e "$dir" ] && ! mv "$dir" "$TMP/corvus-previous"; then
+    say "  [WARNING] Could not replace the old Corvus; continuing with rea/Ghidra."; return
+  fi
+  if ! mv "$TMP/corvus-unpack" "$dir"; then
+    [ -e "$TMP/corvus-previous" ] && mv "$TMP/corvus-previous" "$dir"
+    say "  [WARNING] Corvus could not be installed; continuing with rea/Ghidra."; return
+  fi
+  NEW_PATH="$dir:$NEW_PATH"; export PATH="$dir:$PATH"
+  ok "Corvus $version installed (fingerprint verified)"
+}
+
 # ---- The AI ------------------------------------------------------------------------------------
 
 ensure_ai() {
@@ -299,6 +347,7 @@ write_env() {
     [ -n "$NEW_PATH" ] && echo "export PATH=\"${NEW_PATH%:}:\$PATH\""
     [ -n "$NEW_JAVA_HOME" ] && echo "export JAVA_HOME=\"$NEW_JAVA_HOME\""
     [ -n "$NEW_GHIDRA" ] && echo "export GHIDRA_INSTALL_DIR=\"$NEW_GHIDRA\""
+    [ -n "$NEW_GHIDRA" ] && echo "export CORVUS_GHIDRA_DIR=\"$NEW_GHIDRA\""
     echo "export REA_ANALYSIS_PROVIDER=ghidra"
   } > "$ENVFILE"
 }
@@ -352,6 +401,7 @@ ensure_java
 ensure_ghidra
 ensure_decompiler
 ensure_rea
+ensure_corvus
 [ "$MODE" = "friend" ] && ensure_ai
 
 if [ -n "$PROBLEMS" ]; then

@@ -21,7 +21,7 @@ function readState(path: string): State {
   state.proposals ??= [];
   state.invites ??= [];
   const kinds = state.project?.rules?.allowedKinds;
-  if (Array.isArray(kinds)) for (const k of ["variable_name", "signature", "struct_def"]) if (!kinds.includes(k)) kinds.push(k);
+  if (Array.isArray(kinds) && !state.project.provider) for (const k of ["variable_name", "signature", "struct_def"]) if (!kinds.includes(k)) kinds.push(k);
   return state;
 }
 

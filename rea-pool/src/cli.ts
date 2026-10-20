@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CORVUS_FIX, corvusAvailable, type AnalysisProvider } from "./corvus.ts";
 import type { NoteStatus, Project, Task } from "./types.ts";
 import { allPassed, runAllChecks } from "./check.ts";
 import { NOTE_PROTOCOL } from "./trust.ts";
@@ -24,6 +25,7 @@ interface Config {
   targetPath?: string;
   aiCommand?: string;
   model?: string;
+  provider?: AnalysisProvider;
 }
 
 const CONFIG_PATH = process.env.REA_POOL_CONFIG ?? join(homedir(), ".rea-pool.json");
@@ -149,7 +151,7 @@ async function doCheck(config: Config, project: Project, quiet = false): Promise
   const results = await runAllChecks(project, config.targetPath);
   const ok = allPassed(results);
   if (!quiet || !ok) for (const r of results) console.log(`${r.status === "pass" ? "  OK  " : " FAIL "} ${r.name}\n        ${r.message}`);
-  console.log(ok ? "\nEverything matches." : "\nFix the items marked FAIL first. Everyone must use the same setup so results can be trusted.");
+  if (!quiet || !ok || !project.provider) console.log(ok ? "\nEverything matches." : "\nFix the items marked FAIL first. Everyone must use the same setup so results can be trusted.");
   return ok;
 }
 
@@ -179,6 +181,10 @@ function failureNote(err: unknown): string {
 async function runLoop(config: Config, flags: Record<string, string>): Promise<void> {
   const { project } = await api<{ project: Project }>(config, "GET", "/project");
   if (!(await doCheck(config, project, true))) process.exit(2);
+  if (project.provider) {
+    config.provider = project.provider;
+    await ensurePrepared(config, { quiet: true });
+  }
 
   const model = flags.model ?? config.model ?? process.env.REA_POOL_MODEL ?? "unknown";
   const aiCommand = flags.ai ?? config.aiCommand ?? process.env.REA_POOL_AI ?? detectAi(model === "unknown" ? undefined : model);
@@ -190,7 +196,7 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
     config.aiCommand = flags.ai;
     saveConfig(config);
   }
-  const ctx: AgentContext = { targetPath: config.targetPath!, aiCommand, model, allowedKinds: project.rules?.allowedKinds };
+  const ctx: AgentContext = { targetPath: config.targetPath!, aiCommand, model, allowedKinds: project.rules?.allowedKinds, provider: project.provider };
   patient = true;
   console.log(`Running as ${config.name}. Press Ctrl+C to stop; your task goes back to the pool.\n`);
 
@@ -296,6 +302,11 @@ async function runLoop(config: Config, flags: Record<string, string>): Promise<v
 async function ensurePrepared(config: Config, opts: { force?: boolean; quiet?: boolean } = {}): Promise<void> {
   // When this runs on its own (pool run / pool next) messages go to stderr, so stdout stays clean for agents reading it.
   const say = opts.quiet ? console.error : console.log;
+  if (config.provider) {
+    const { project } = await api<{ project: Project }>(config, "GET", "/project");
+    if (!(await doCheck(config, project, true))) process.exit(2);
+    config.provider = project.provider;
+  }
   if (!config.targetPath) {
     if (opts.quiet) return;
     console.error("No copy of the software is set yet. Use: pool set-target <path>");
@@ -303,14 +314,14 @@ async function ensurePrepared(config: Config, opts: { force?: boolean; quiet?: b
   }
   if (opts.quiet) {
     try {
-      if (loadDump(config.targetPath)) return;
+      if (loadDump(config.targetPath, config.provider)) return;
     } catch {
       // Treated like no cache.
     }
     say("Preparing your copy once (about a minute); after this every task is instant...");
   }
   try {
-    const r = await prepareTarget(config.targetPath, { force: opts.force, log: say });
+    const r = await prepareTarget(config.targetPath, { force: opts.force, log: say, provider: config.provider });
     say(r.fromCache ? `Already prepared: ${r.functions} functions` : `Ready: ${r.functions} functions cached (took ${r.seconds}s)`);
   } catch (err) {
     const why = (err instanceof Error ? err.message : String(err)).split("\n")[0];
@@ -360,7 +371,8 @@ async function main() {
         console.error(`The leader said: ${data.error ?? "could not join"}`);
         process.exit(1);
       }
-      const config: Config = { leaderUrl: url, token: data.token, name: data.name };
+      const config: Config = { leaderUrl: url, token: data.token, name: data.name, ...(data.project.provider ? { provider: data.project.provider } : {}) };
+      const needsCorvus = data.project.provider === "corvus-dotnet";
       if (flags.target && flags.target !== "true") {
         if (!existsSync(flags.target)) {
           console.error(`Joined, but the file ${flags.target} was not found. Set it later with: pool set-target <path>`);
@@ -370,9 +382,14 @@ async function main() {
       }
       saveConfig(config);
       console.log(`Joined "${data.project.name}" as ${data.name}.`);
+      if (needsCorvus && !corvusAvailable()) {
+        console.error(`This project needs Corvus. Run: ${CORVUS_FIX}`);
+        process.exit(2);
+      }
       if (config.targetPath) {
         console.log("\nChecking your setup...\n");
-        await doCheck(config, data.project);
+        const checked = await doCheck(config, data.project);
+        if (needsCorvus && !checked) process.exit(2);
         console.log("\nNext: pool run");
       } else {
         console.log(`Next: pool set-target <path to your copy of ${data.project.target.filename}>, then pool run`);
@@ -421,7 +438,7 @@ async function main() {
       break;
     case "run": {
       const config = loadConfig();
-      await ensurePrepared(config, { quiet: true });
+      if (!config.provider) await ensurePrepared(config, { quiet: true });
       await runLoop(config, flags);
       break;
     }
@@ -449,7 +466,7 @@ async function main() {
         break;
       }
       const isReview = claim.task.kind === "review";
-      const { code } = inspectFunction(config.targetPath!, claim.task.address);
+      const { code } = inspectFunction(config.targetPath!, claim.task.address, config.provider);
       console.log(
         JSON.stringify(
           {
@@ -481,9 +498,9 @@ async function main() {
         console.error(claim.task ? "Your current task is a check: use  pool verdict agree|disagree|unsure" : "You have no task. Run: pool next");
         process.exit(1);
       }
-      const { shape, callees } = inspectFunction(config.targetPath!, claim.task.address);
+      const { shape, callees } = inspectFunction(config.targetPath!, claim.task.address, config.provider);
       const level = ["low", "medium", "high"].includes(confidence) ? confidence : "low";
-      const common = { confidence: level, model: flags.model ?? config.model ?? "unknown", agent: "rea-pool-skill", evidence: ["decompiled by Ghidra via rea"] };
+      const common = { confidence: level, model: flags.model ?? config.model ?? "unknown", agent: "rea-pool-skill", evidence: [config.provider === "corvus-dotnet" ? "decompiled by Corvus" : "decompiled by Ghidra via rea"] };
       const notes = [{ kind: "function_name", value: name, ...common }, { kind: "comment", value: summary, ...common }, ...detailsFromFlags(flags).map((d) => ({ ...d, ...common }))];
       const alternatives = flags.alt && flags.alt !== "true" ? cleanAlternatives(flags.alt.split(","), name) : [];
       const sub = await submitOrQueue<{ results: { status: NoteStatus; reason?: string }[] }>(config, { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });

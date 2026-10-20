@@ -44,6 +44,9 @@ export interface Project {
   name: string;
   created: string;
   target: { filename: string; sha256: string; size: number };
+  /** Missing keeps the original rea/Ghidra reader. Managed projects pin the extra reader. */
+  provider?: "corvus-dotnet";
+  corvusVersion?: string;
   tools: ToolSpec[];
   rules: Rules;
 }
@@ -81,7 +84,7 @@ export interface Task {
   /** For analyze tasks: how many times this was reopened because a callee name changed under it. */
   reopened?: number;
   /** A name Ghidra or the program's symbols already gave this function. Such tasks are created "done" and need no work. */
-  known?: { name: string; source: "ghidra" };
+  known?: { name: string; source: "ghidra" | "corvus" };
   /** True once this finished function was reopened for a second pass because callers got named. Happens at most once. */
   refined?: boolean;
 }

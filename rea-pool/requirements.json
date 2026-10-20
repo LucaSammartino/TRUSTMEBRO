@@ -13,5 +13,18 @@
   "ghidraFolderName": "ghidra_12.1.4_PUBLIC",
   "reaVersion": "6.7.0",
   "reaNpmPackage": "rea-agents",
-  "toolsFolder": "rea-pool-tools"
+  "toolsFolder": "rea-pool-tools",
+  "corvusVersion": "2.4.0",
+  "corvusLinuxX64Asset": "corvus-linux-x64.tar.gz",
+  "corvusLinuxX64Sha256": "a70bfde1e744e301a110577ce75ee4041be26f111b8fe5803f4db0f7f5f4ef4b",
+  "corvusLinuxArm64Asset": "corvus-linux-arm64.tar.gz",
+  "corvusLinuxArm64Sha256": "476b99e14642d2fb9f122e4e49117b6f0a15454b795ea30631174672a2da5d85",
+  "corvusOsxX64Asset": "corvus-osx-x64.tar.gz",
+  "corvusOsxX64Sha256": "1c0d7d09f1499f560b78b3c54b66b2643f6e1e18015e5f0f6943af29906b8b68",
+  "corvusOsxArm64Asset": "corvus-osx-arm64.tar.gz",
+  "corvusOsxArm64Sha256": "973de460b4593bda2139b1899da0212874929a96f59ece572c6ef021b4a80313",
+  "corvusWinX64Asset": "corvus-win-x64.zip",
+  "corvusWinX64Sha256": "8ac90008fa8b880637ba0aac9f6ba5033d61521cfa837e0187fb62b6e2f84f35",
+  "corvusWinArm64Asset": "corvus-win-arm64.zip",
+  "corvusWinArm64Sha256": "64ddbaa881266db9598a23c872f50f879cf7317432482572d679e8e79f83e7f3"
 }

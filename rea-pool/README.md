@@ -27,6 +27,44 @@ Windows uses `START-HERE.cmd` / `pool.cmd` / `leader.cmd`. macOS uses `START-HER
 
 Setup needs about 3 GB of disk and internet the first time. It installs Node 24, Java 21, Ghidra 12.1.4 (checked against its published fingerprint) and rea 6.7.0 into your own folder (`~/.rea-pool`); on Windows it sets `JAVA_HOME`, `GHIDRA_INSTALL_DIR` and `REA_ANALYSIS_PROVIDER` for your user. Apple Silicon Macs build Ghidra's decompiler once (needs `xcode-select --install` and `brew install bison`).
 
+## Games: Unity, .NET and more (Corvus)
+
+[Corvus](https://github.com/Albasha0x0/Corvus) is an optional extra reader (MIT license). rea and Ghidra remain the default. Existing projects keep their reader, and everything works as before when Corvus is absent.
+
+Setup offers **Corvus (extra reader for Unity/.NET games)**. It downloads the pinned v2.4.0 archive from the project's GitHub release, checks its SHA-256 fingerprint against `requirements.json`, then unpacks it into your tools folder. A failed download or fingerprint check only warns; the usual setup can still finish. It never runs Corvus' installer or registers an MCP client.
+
+- Linux/macOS: `bash setup.sh --mode setup-only --yes` includes Corvus. Add `--no-corvus` to skip it.
+- Windows: `powershell -ExecutionPolicy Bypass -File setup.ps1 -Mode setup-only -Yes` includes it. Add `-NoCorvus` (also `-no-corvus`) to skip it.
+- Linux/macOS use `~/.rea-pool/tools/corvus`; Windows uses the existing `~/rea-pool-tools/corvus` folder. Setup adds it to the same command environment as rea and sets `CORVUS_GHIDRA_DIR` to the installed Ghidra folder. Ghidra's Corvus worker needs a JDK and builds on first use.
+
+| Your game file | What the pool uses |
+|---|---|
+| Unity Mono or another managed .NET `.dll` / `.exe` (PE CLR header, including ReadyToRun) | New projects automatically use Corvus when installed: one task per method, C# (or IL when needed), and method calls. Friends must have Corvus 2.4.0 too; joining or checking prints the setup command if it is missing or the wrong version. |
+| Unity Il2Cpp `GameAssembly.dll` or `libil2cpp.so`, with nearby `global-metadata.dat` | rea/Ghidra still reads the code. `leader graph` and `leader prepare` optionally read names from the metadata and skip untouched functions that already have a usable, unique name. |
+| Native PE, ELF or Mach-O game engine, including NativeAOT | The usual rea/Ghidra workflow. Corvus can also carry trusted names between native builds, as below. |
+| APK / DEX or a packaged game | Corvus itself has APK, DEX and JADX tools. Pool tasks for these containers are **not connected yet**. Use the locally extracted managed assembly or native game binary with its metadata. |
+
+To choose the usual reader for a new managed project, use `leader start <file> --no-corvus`. This choice is saved in the project; workers use the same reader. Managed caches are kept separately from Ghidra caches. `leader graph <file> --no-corvus` or `leader prepare <file> --no-corvus` skips the extra Il2Cpp name import. `--keep-named` also skips it. An unreadable metadata export warns and leaves the usual reader working. No generated Corvus scripts are executed.
+
+Nearby metadata includes the binary's folder, `Game_Data/il2cpp_data/Metadata`, and Android's extracted `assets/bin/Data/Managed/Metadata` layout. Automatic Il2Cpp name rebasing supports PE and little-endian ELF. Preparation records Ghidra's actual address base when Corvus is installed; an older ELF cache needs `leader prepare <file> --force` before importing names. Metadata names are converted to plain identifiers, checked with the pool's existing rules and marked with source `corvus`; existing work is kept. All game code and Corvus output remain untrusted data. Corvus calls run with offline mode enabled; program files and code are never sent to the pool.
+
+For managed projects, work commands stay the same: `pool prepare`, `pool run`, `pool next`, and the MCP tools all use the saved reader. Save results with `leader export results.json --best`. Ghidra's `leader apply` is for native programs; applying .NET names is not connected yet. C-style variable, signature and struct notes are not requested for managed methods.
+
+### Carry names to a patched game
+
+Keep both builds on your computer. Export the old project's trusted names with `leader export results.json --best`, then create a separate project:
+
+```sh
+leader import-names results.json "old/GameAssembly.dll" "new/GameAssembly.dll" --data new-project
+leader start --data new-project
+```
+
+This checks that the old file matches the export's fingerprint and reads only trusted, non-stale function names with the standard `fn-0x...` task IDs. Corvus records those names as annotations in its local cache for the old build, then previews `migrate_native_names` with code matching, tiers 1–2 and confidence at least 0.95. Only checked matches to functions in the new project become trusted names, available through `leader apply`. The original files are not rewritten. Existing projects are never replaced; choose an empty folder with `--data`.
+
+TODO: connect `update_to_new_build` / `find_counterpart` for managed games, and APK/DEX task scheduling. The current name migration is for native builds, including Il2Cpp. Actual Corvus output, platform archives, rebasing and migration accuracy still need an owner-approved real run; this integration has been checked only with mocks.
+
+References: [tools](https://github.com/Albasha0x0/Corvus/blob/v2.4.0/docs/tools.md), [CLI](https://github.com/Albasha0x0/Corvus/blob/v2.4.0/docs/cli.md), [features](https://github.com/Albasha0x0/Corvus/blob/main/docs/features.md), [installation](https://github.com/Albasha0x0/Corvus/blob/main/docs/installation.md), [configuration](https://github.com/Albasha0x0/Corvus/blob/main/docs/configuration.md), [engine databases](https://github.com/Albasha0x0/Corvus/blob/main/docs/engine-databases.md).
+
 ## Letting friends connect
 
 Friends connect to the leader's computer with ordinary web requests, so it must be reachable and stay on.

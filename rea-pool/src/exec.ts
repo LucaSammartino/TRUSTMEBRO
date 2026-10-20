@@ -4,6 +4,7 @@ export const IS_WINDOWS = process.platform === "win32";
 
 export interface RunOptions {
   input?: string;
+  env?: NodeJS.ProcessEnv;
   timeout?: number;
   maxBuffer?: number;
 }
@@ -26,6 +27,7 @@ export function runCommand(program: string, args: string[], options: RunOptions 
   const base = {
     encoding: "utf8" as const,
     input: options.input,
+    ...(options.env ? { env: options.env } : {}),
     timeout: options.timeout ?? 120_000,
     maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
   };
@@ -52,12 +54,12 @@ export function runCommandAsync(program: string, args: string[], options: RunOpt
   const maxBuffer = options.maxBuffer ?? 64 * 1024 * 1024;
   let child: ChildProcess;
   if (!IS_WINDOWS) {
-    child = spawn(program, args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
+    child = spawn(program, args, { shell: false, stdio: ["pipe", "pipe", "pipe"], ...(options.env ? { env: options.env } : {}) });
   } else {
     for (const part of [program, ...args]) {
       if (UNSAFE_ON_WINDOWS.test(part)) throw new Error("A path or value contains characters this tool cannot use. Move the file to a simpler folder.");
     }
-    child = spawn([program, ...args].map(windowsQuote).join(" "), { shell: true, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    child = spawn([program, ...args].map(windowsQuote).join(" "), { shell: true, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, ...(options.env ? { env: options.env } : {}) });
   }
   return new Promise((resolve) => {
     let stdout = "";

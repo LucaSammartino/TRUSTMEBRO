@@ -1,3 +1,4 @@
+import { CORVUS_FIX, CORVUS_VERSION, findCorvus } from "./corvus.ts";
 import { IS_WINDOWS, runCommand } from "./exec.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -12,7 +13,7 @@ export interface CheckResult {
 
 // The leader's project file is not trusted to run arbitrary commands on your computer.
 // Only these programs, asked only for their version, are ever run.
-const ALLOWED_PROGRAMS = new Set(["java", "node", "rea", "python", "python3", "docker", "ghidraRun", "git"]);
+const ALLOWED_PROGRAMS = new Set(["java", "node", "rea", "python", "python3", "docker", "ghidraRun", "git", "corvus"]);
 const ALLOWED_ARGS = new Set(["--version", "-version", "version", "-v", "-V"]);
 
 export function isSafeVersionCommand(command: string[]): boolean {
@@ -40,7 +41,7 @@ export function readVersion(tool: ToolSpec): { version: string } | { error: stri
   }
   const [rawProgram, ...args] = tool.command;
   // Use the Java that JAVA_HOME points at (that is the one Ghidra will use), not whatever is first on the PATH.
-  const program = rawProgram === "java" && process.env.JAVA_HOME ? join(process.env.JAVA_HOME, "bin", IS_WINDOWS ? "java.exe" : "java") : rawProgram;
+  const program = rawProgram === "corvus" ? findCorvus() ?? "corvus" : rawProgram === "java" && process.env.JAVA_HOME ? join(process.env.JAVA_HOME, "bin", IS_WINDOWS ? "java.exe" : "java") : rawProgram;
   let run;
   try {
     run = runCommand(program, args, { timeout: 15000 });
@@ -93,6 +94,14 @@ export async function checkTarget(project: Project, targetPath: string | undefin
 
 export async function runAllChecks(project: Project, targetPath: string | undefined): Promise<CheckResult[]> {
   const results: CheckResult[] = [await checkTarget(project, targetPath)];
+  if (project.provider !== undefined && project.provider !== "corvus-dotnet") {
+    results.push({ name: "Reader", status: "fail", message: "This project needs a reader this version does not know. Update rea-pool." });
+  }
+  if (project.provider === "corvus-dotnet") {
+    const tool = checkTool({ name: "corvus", command: ["corvus", "--version"], versionRegex: "(\\d+\\.\\d+\\.\\d+)", required: project.corvusVersion ?? CORVUS_VERSION, match: "exact" });
+    if (tool.status === "fail") tool.message = `This project needs Corvus ${project.corvusVersion ?? CORVUS_VERSION}. Run: ${CORVUS_FIX}`;
+    results.push(tool);
+  }
   for (const tool of project.tools) results.push(checkTool(tool));
   return results;
 }

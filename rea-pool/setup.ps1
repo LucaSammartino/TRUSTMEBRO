@@ -5,11 +5,13 @@
 #   -Mode friend       (default) set up, join if needed, then run
 #   -Mode setup-only   just set up (for the leader)
 #   -CheckOnly         only report what is missing; install nothing and ask nothing
+#   -NoCorvus          skip the optional game reader
 #   -Yes               do not ask, just install what is missing (for unattended use)
 param(
   [ValidateSet("friend", "setup-only")][string]$Mode = "friend",
   [switch]$CheckOnly,
-  [switch]$Yes
+  [switch]$Yes,
+  [Alias("no-corvus")][switch]$NoCorvus
 )
 
 $ErrorActionPreference = "Stop"
@@ -185,6 +187,71 @@ function Ensure-Rea {
   }
 }
 
+# ---- Corvus (optional) -------------------------------------------------------------------------
+
+function Get-CorvusVersion($program) {
+  try {
+    $v = (& $program --version) 2>$null
+    if ($v -match "(\d+\.\d+\.\d+)") { return $Matches[1] }
+  } catch { }
+  return $null
+}
+
+function Ensure-Corvus {
+  if ($NoCorvus) { return }
+  Say "Corvus (extra reader for Unity/.NET games)"
+  $zip = Join-Path $ToolsDir "corvus-download.zip"
+  $unpack = Join-Path $ToolsDir "corvus-unpack"
+  $cleanup = $false
+  $backup = $null
+  try {
+    $dir = Join-Path $ToolsDir "corvus"
+    if ((Has-Command "corvus") -and (Get-CorvusVersion "corvus") -eq $Req.corvusVersion) { Ok "Corvus (optional) found"; return }
+    if ((Test-Path (Join-Path $dir "corvus.exe")) -and (Get-CorvusVersion (Join-Path $dir "corvus.exe")) -eq $Req.corvusVersion) {
+      if (-not $CheckOnly) { Add-CorvusPath $dir }
+      Ok "Corvus (optional) found"; return
+    }
+    if ($CheckOnly) { Say "  Optional reader not installed; rea/Ghidra still works."; return }
+    if (-not (Ask "Install Corvus (extra reader for Unity/.NET games)?")) { return }
+    $cleanup = $true
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") { "WinArm64" } else { "WinX64" }
+    $asset = $Req.("corvus" + $arch + "Asset")
+    $sum = $Req.("corvus" + $arch + "Sha256")
+    New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
+    & curl.exe -L --fail --silent --show-error -o $zip ("https://github.com/Albasha0x0/Corvus/releases/download/v" + $Req.corvusVersion + "/" + $asset)
+    if ($LASTEXITCODE -ne 0) { throw "Download failed." }
+    if (-not $sum -or (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $sum) {
+      throw "The fingerprint did not match. The download was NOT unpacked or installed."
+    }
+    Expand-Archive -Path $zip -DestinationPath $unpack -Force
+    if (-not (Test-Path (Join-Path $unpack "corvus.exe"))) { throw "The archive did not contain corvus.exe." }
+    if (Test-Path $dir) {
+      $backup = Join-Path $ToolsDir ("corvus-previous-" + [guid]::NewGuid().ToString("N"))
+      Move-Item $dir $backup
+    }
+    try { Move-Item $unpack $dir } catch {
+      if ($backup) { Move-Item $backup $dir; $backup = $null }
+      throw
+    }
+    Add-CorvusPath $dir
+    Ok ("Corvus " + $Req.corvusVersion + " installed (fingerprint verified)")
+  } catch {
+    Say ("  [WARNING] Corvus was not installed: " + $_.Exception.Message + " Continuing with rea/Ghidra.") Yellow
+  } finally {
+    if ($cleanup) {
+      Remove-Item $zip -Force -ErrorAction SilentlyContinue
+      Remove-Item $unpack -Recurse -Force -ErrorAction SilentlyContinue
+      if ($backup) { Remove-Item $backup -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+  }
+}
+
+function Add-CorvusPath($dir) {
+  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  if (($userPath -split ";") -notcontains $dir) { Set-UserEnv "Path" ($dir + ";" + $userPath) }
+  if (($env:Path -split ";") -notcontains $dir) { $env:Path = $dir + ";" + $env:Path }
+}
+
 # ---- The AI ------------------------------------------------------------------------------------
 
 function Ensure-Ai {
@@ -252,6 +319,10 @@ function Main {
   Ensure-Java
   Ensure-Ghidra
   Ensure-Rea
+  Ensure-Corvus
+  if (-not $CheckOnly -and $env:GHIDRA_INSTALL_DIR) {
+    try { Set-UserEnv "CORVUS_GHIDRA_DIR" $env:GHIDRA_INSTALL_DIR } catch { Say "  [WARNING] Could not save Corvus Ghidra setting; GHIDRA_INSTALL_DIR will be used." Yellow }
+  }
   if ($Mode -eq "friend") { Ensure-Ai }
 
   if ($script:Problems.Count -gt 0) {

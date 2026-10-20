@@ -32,6 +32,11 @@ public class DumpAll extends GhidraScript {
   @Override
   public void run() throws Exception {
     String out = getScriptArgs()[0];
+    if (getScriptArgs().length > 1) {
+      try (PrintWriter base = new PrintWriter(new OutputStreamWriter(new FileOutputStream(getScriptArgs()[1]), "UTF-8"))) {
+        base.println("{\"imageBase\":\"0x" + Long.toUnsignedString(currentProgram.getImageBase().getOffset(), 16) + "\"}");
+      }
+    }
     long t0 = System.currentTimeMillis();
     DecompInterface di = new DecompInterface();
     di.openProgram(currentProgram);

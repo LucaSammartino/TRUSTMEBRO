@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 // Leader tool. One command does the setup:  leader start <software-file>
+import { CorvusClient, CORVUS_VERSION, listManagedMethods, selectProvider } from "./corvus.ts";
 import { randomBytes } from "node:crypto";
 import { runCommand, runCommandAsync } from "./exec.ts";
 import { fillCalleesFromDump, markKnownFromDump } from "./agent.ts";
-import { loadDump, prepareTarget } from "./prepare.ts";
+import { cachedImageBase, loadDump, prepareTarget } from "./prepare.ts";
 import { addCallees, calleesFromReaFunction, graphStats, normalizeAddress } from "./graph.ts";
 import { isShape, shapeOf } from "./similar.ts";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { networkInterfaces } from "node:os";
 import type { Note, Project, State, Task, ToolSpec } from "./types.ts";
-import { createInvite, createPoolServer, listInvites, loadState, overrideNote, revokeInvite, saveState } from "./server.ts";
+import { createInvite, createPoolServer, listInvites, loadState, overrideNote, revokeInvite, saveState, submitAnalysis } from "./server.ts";
 import { DETAIL_KINDS } from "./rules.ts";
 import { readVersion } from "./check.ts";
 import { buildActivity } from "./activity.ts";
@@ -59,7 +60,7 @@ function parseArgs(argv: string[]) {
 function usage(): never {
   console.log(`rea-pool leader tool
 
-  start <software-file> [--name "Project"] [--port 8787] [--host <address>]
+  start <software-file> [--no-corvus] [--name "Project"] [--port 8787] [--host <address>]
         Set everything up (first time) and run the server. Run it again later to resume.
   link [--port 8787]                  Show the line friends use to join
   status                              Show progress
@@ -87,6 +88,8 @@ function usage(): never {
   close-shared | open-shared          Switch the shared join code off / on (personal invites keep working)
   export-state [file]                 Copy the whole project (default ./pool-export.json) to hand the leader job
                                       to someone else. Contains everyone's access: give it only to someone you trust
+  import-names <results.json> <old-file> <new-file> --data <new-folder>
+                                      Carry trusted names to a new native game build with Corvus
   import-state <file> [--force]       New leader: load an exported project into the data folder, then run start.
                                       Everyone then runs  pool set-leader <new address>
   retry-models <label,label|none>    Model labels that get retries first (none clears)
@@ -132,16 +135,25 @@ function addTasks(state: State, incoming: { id: string; label?: string; address:
   return added;
 }
 
-async function createProject(file: string, dataDir: string, name: string | undefined): Promise<State> {
+async function createProject(file: string, dataDir: string, name: string | undefined, noCorvus = false): Promise<State> {
   mkdirSync(dataDir, { recursive: true });
+  const provider = selectProvider(file, noCorvus);
+  if (provider) {
+    const found = readVersion({ name: "corvus", command: ["corvus", "--version"], versionRegex: "(\\d+\\.\\d+\\.\\d+)", required: CORVUS_VERSION, match: "exact" });
+    if (!("version" in found) || found.version !== CORVUS_VERSION) {
+      const { CORVUS_FIX } = await import("./corvus.ts");
+      throw new Error(`This game needs Corvus ${CORVUS_VERSION}. Run: ${CORVUS_FIX}`);
+    }
+  }
   const project: Project = {
     schema: "rea-pool/1",
     name: name ?? basename(file),
     created: new Date().toISOString(),
     target: { filename: basename(file), sha256: await sha256File(file), size: statSync(file).size },
-    tools: pinnedTools(),
+    ...(provider ? { provider, corvusVersion: CORVUS_VERSION } : {}),
+    tools: provider ? [] : pinnedTools(),
     rules: {
-      allowedKinds: ["function_name", "comment", "type_note", "rejected_hypothesis", ...DETAIL_KINDS],
+      allowedKinds: ["function_name", "comment", "type_note", "rejected_hypothesis", ...(provider ? [] : DETAIL_KINDS)],
       maxTextLength: 500,
       maxEvidenceItems: 5,
       leaseMinutes: 30,
@@ -198,7 +210,44 @@ function mergeGraphIntoState(statePath: string, graph: Record<string, string[]>,
   return merged;
 }
 
+async function importGameNames(file: string, statePath: string, flags: Record<string, string>): Promise<void> {
+  const snapshot = loadState(statePath);
+  if (snapshot.project.provider || flags["no-corvus"] !== undefined || flags["keep-named"] !== undefined) return;
+  // Check the file before trusting metadata from its folder.
+  const { corvusAvailable, detectTargetKind, il2cppNames } = await import("./corvus.ts");
+  if (!corvusAvailable() || detectTargetKind(file) !== "il2cpp") return;
+  if (await sha256File(file) !== snapshot.project.target.sha256) throw new Error("This file does not match the project. Use the same game build.");
+  try {
+    const base = cachedImageBase(file);
+    if (/\.so$/i.test(file) && base === null) {
+      console.log("Corvus needs Ghidra's address base for this library. Run leader prepare <file> --force, then graph again. Continuing with rea/Ghidra.");
+      return;
+    }
+    const names = await il2cppNames(file, undefined, base);
+    const fresh = loadState(statePath);
+    const { markCorvusNames } = await import("./agent.ts");
+    const count = markCorvusNames(fresh, names);
+    if (count) {
+      saveState(statePath, fresh);
+      console.log(`${count} functions already have Unity names from Corvus; skipping them`);
+    }
+  } catch {
+    console.log("Corvus could not read the Unity names; continuing with rea/Ghidra.");
+  }
+}
+
 async function buildGraph(file: string, dataDir: string, statePath: string, flags: Record<string, string>): Promise<void> {
+  const project = loadState(statePath).project;
+  if (project.provider === "corvus-dotnet") {
+    if (await sha256File(file) !== project.target.sha256) throw new Error("This file does not match the project. Use the same game build.");
+    await prepareTarget(file, { provider: project.provider, log: console.log });
+    const fresh = loadState(statePath);
+    const filled = fillCalleesFromDump(fresh, file);
+    if (filled) saveState(statePath, fresh);
+    console.log(`Filled ${filled} methods from Corvus.`);
+    console.log(formatGraphStats(fresh));
+    return;
+  }
   const num = (v: string | undefined, fallback: number) => (v && v !== "true" && Number.isFinite(Number(v)) ? Math.floor(Number(v)) : fallback);
   const parallel = Math.min(16, Math.max(1, num(flags.parallel, 4)));
   const limit = num(flags.limit, Infinity);
@@ -211,7 +260,7 @@ async function buildGraph(file: string, dataDir: string, statePath: string, flag
     try {
       if (!loadDump(file)) {
         console.log("Preparing a local copy of the program once (about a minute)...");
-        await prepareTarget(file, { log: console.log });
+        await prepareTarget(file, { log: console.log, noCorvus: flags["no-corvus"] !== undefined });
       }
       const state = loadState(statePath);
       const filled = fillCalleesFromDump(state, file);
@@ -240,6 +289,7 @@ async function buildGraph(file: string, dataDir: string, statePath: string, flag
     }
   }
 
+  await importGameNames(file, statePath, flags);
   const first = loadState(statePath);
   const isCandidate = (t: Task) => (t.kind ?? "analyze") === "analyze" && t.callees === undefined;
   const fromFile = first.tasks.filter((t) => isCandidate(t) && graph[normalizeAddress(t.address) ?? ""]).length;
@@ -362,11 +412,15 @@ async function main() {
         process.exit(1);
       }
       const name = flags.name && flags.name !== "true" ? flags.name : undefined;
-      const state = await createProject(file, dataDir, name);
+      const state = await createProject(file, dataDir, name, flags["no-corvus"] !== undefined);
       console.log(`Project "${state.project.name}" created. Software fingerprint: ${state.project.target.sha256.slice(0, 16)}...`);
       console.log("Contributors must have:");
+      if (state.project.provider) console.log(`  - Corvus ${state.project.corvusVersion}`);
       for (const t of state.project.tools) console.log(`  - ${t.name} ${t.required}`);
-      const added = addTasks(state, listFunctions(file));
+      const incoming = state.project.provider === "corvus-dotnet"
+        ? (await listManagedMethods(new CorvusClient(file))).map((m) => ({ id: `fn-${m.address}`, address: m.address, label: `Method at ${m.address}` }))
+        : listFunctions(file);
+      const added = addTasks(state, incoming);
       saveState(statePath, state);
       console.log(`Created ${added} tasks (one per function).`);
       printJoinLine(state, port, host);
@@ -448,7 +502,7 @@ async function main() {
         console.error(`A project already exists in ${dataDir}. Refusing to overwrite it.`);
         process.exit(1);
       }
-      const state = await createProject(file, dataDir, flags.name && flags.name !== "true" ? flags.name : undefined);
+      const state = await createProject(file, dataDir, flags.name && flags.name !== "true" ? flags.name : undefined, flags["no-corvus"] !== undefined);
       if (flags.tools) state.project.tools = readJson<ToolSpec[]>(flags.tools);
       saveState(statePath, state);
       console.log(`Project "${state.project.name}" created.`);
@@ -514,7 +568,9 @@ async function main() {
         process.exit(1);
       }
       try {
-        const r = await prepareTarget(file, { force: flags.force !== undefined, log: console.log });
+        const provider = existsSync(statePath) ? loadState(statePath).project.provider : selectProvider(file, flags["no-corvus"] !== undefined);
+        const r = await prepareTarget(file, { force: flags.force !== undefined, log: console.log, provider, noCorvus: flags["no-corvus"] !== undefined });
+        if (existsSync(statePath)) await importGameNames(file, statePath, flags);
         console.log(r.fromCache ? `Already prepared: ${r.functions} functions` : `Ready: ${r.functions} functions cached (took ${r.seconds}s)`);
       } catch (err) {
         console.error(err instanceof Error ? err.message : String(err));
@@ -534,6 +590,7 @@ async function main() {
     }
     case "apply": {
       const state = needState();
+      if (state.project.provider === "corvus-dotnet") throw new Error("For a .NET game, save names with leader export results.json --best. Applying .NET names is not connected yet; Ghidra apply is for native code.");
       const outDir = rest[0] ?? join(dataDir, "apply");
       let writeApplyBundle: (s: State, dir: string) => { namesFile: string; scriptFile: string; count: number };
       try {
@@ -575,6 +632,30 @@ async function main() {
       console.log(`Saved the whole project to ${out}.`);
       console.log("WARNING: this file contains everyone's access (their token hashes and the join code). Only give it to someone you trust.");
       console.log(`To hand over: the new leader runs  import-state ${out}  and then  start; everyone else runs  pool set-leader <new address>.`);
+      break;
+    }
+    case "import-names": {
+      const [resultsFile, oldFile, newFile] = rest;
+      if (!resultsFile || !oldFile || !newFile || ![resultsFile, oldFile, newFile].every(existsSync)) throw new Error("Usage: leader import-names <results.json> <old program file> <new program file> --data <new project folder>");
+      if (existsSync(statePath)) throw new Error("Choose an empty project folder with --data. Your existing project will be kept.");
+      const { detectTargetKind, corvusAvailable, CORVUS_FIX } = await import("./corvus.ts");
+      if (!corvusAvailable()) throw new Error(`Name carry-over needs Corvus. Run: ${CORVUS_FIX}`);
+      if (detectTargetKind(oldFile) === "dotnet" || detectTargetKind(newFile) === "dotnet") throw new Error("Name carry-over currently supports native game builds, including Il2Cpp. Managed build matching is not connected yet.");
+      const { trustedBuildNames, migrateBuildNames } = await import("./import-names.ts");
+      const trusted = trustedBuildNames(readJson(resultsFile), await sha256File(oldFile));
+      const mapped = await migrateBuildNames(oldFile, newFile, trusted);
+      const state = await createProject(newFile, dataDir, flags.name && flags.name !== "true" ? flags.name : undefined, true);
+      addTasks(state, listFunctions(newFile));
+      const byAddress = new Map(state.tasks.map((t) => [normalizeAddress(t.address), t]));
+      let seeded = 0;
+      for (const name of mapped) {
+        const task = byAddress.get(name.address);
+        if (!task) continue;
+        const accepted = submitAnalysis(state, "corvus", task, [{ kind: "function_name", value: name.name, confidence: "high", model: "corvus", evidence: ["Trusted name matched from the previous build by Corvus"] }]);
+        if (accepted.some((r) => r.ok)) seeded++;
+      }
+      saveState(statePath, state);
+      console.log(`Created the new project with ${seeded} trusted names carried over. Run leader start --data "${dataDir}" to share it, or leader apply --data "${dataDir}" to write the names for Ghidra.`);
       break;
     }
     case "import-state": {

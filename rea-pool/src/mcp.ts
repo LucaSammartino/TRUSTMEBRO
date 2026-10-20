@@ -2,6 +2,7 @@
 // MCP (Model Context Protocol) server over stdio: lets an AI agent work a rea-pool project through native tools
 // instead of shelling out to `pool next/submit/verdict/release`. Newline-delimited JSON-RPC 2.0.
 // stdout carries JSON-RPC only; diagnostics go to stderr. This file never exits the process and never prints the token.
+import type { AnalysisProvider } from "./corvus.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,6 +17,7 @@ interface Config {
   name: string;
   targetPath?: string;
   model?: string;
+  provider?: AnalysisProvider;
 }
 
 interface Claim {
@@ -28,7 +30,7 @@ interface Claim {
   finished: boolean;
 }
 
-type Inspect = (targetPath: string, address: string) => { code: string; callees: string[]; shape: string | null };
+type Inspect = (targetPath: string, address: string, provider?: AnalysisProvider) => { code: string; callees: string[]; shape: string | null };
 
 /** Errors meant for the agent: plain English, returned as isError results. */
 class ToolError extends Error {}
@@ -130,7 +132,7 @@ async function callTool(name: string, args: Record<string, unknown>, state: { ta
   };
   const runInspect = async (address: string) => {
     try {
-      return (await inspect())(needTarget(), address);
+      return (await inspect())(needTarget(), address, config.provider);
     } catch (err) {
       if (err instanceof ToolError) throw err;
       throw new ToolError(`Could not read the function: ${(err instanceof Error ? err.message : String(err)).split("\n")[0].slice(0, 300)}`);
@@ -165,7 +167,7 @@ async function callTool(name: string, args: Record<string, unknown>, state: { ta
       if (claim.task.kind === "review") throw new ToolError("Your current task is a check: use pool_verdict (agree, disagree or unsure).");
       const { shape, callees } = await runInspect(claim.task.address);
       const level = typeof confidence === "string" && ["low", "medium", "high"].includes(confidence) ? confidence : "low";
-      const common = { confidence: level, model: config.model ?? "unknown", agent: "rea-pool-mcp", evidence: ["decompiled by Ghidra via rea"] };
+      const common = { confidence: level, model: config.model ?? "unknown", agent: "rea-pool-mcp", evidence: [config.provider === "corvus-dotnet" ? "decompiled by Corvus" : "decompiled by Ghidra via rea"] };
       const notes = [{ kind: "function_name", value: fname, ...common }, { kind: "comment", value: summary, ...common }, ...parseExtras(args).map((d) => ({ ...d, ...common }))];
       const alternatives = cleanAlternatives(args.alternatives, fname);
       const { results } = await api<{ results: { status: string; reason?: string }[] }>(config, "POST", "/submit", { protocol: NOTE_PROTOCOL, taskId: claim.task.id, notes, callees, shape, ...(alternatives.length ? { alternatives } : {}) });

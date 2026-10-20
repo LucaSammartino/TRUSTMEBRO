@@ -1,16 +1,18 @@
 // The built-in worker. It does two jobs:
 //   analyze: ask rea (Ghidra) for the decompiled function, ask an AI to name and describe it
 //   review:  ask rea for the same code, ask an AI whether someone else's name and description are right
+import { CorvusClient, inspectManaged, inspectManagedSync, type AnalysisProvider } from "./corvus.ts";
 import { spawn, spawnSync } from "node:child_process";
 import { runCommand, runCommandAsync, runUserCommand } from "./exec.ts";
-import { addCallees, calleesFromReaFunction, cleanCallees } from "./graph.ts";
+import { addCallees, calleesFromReaFunction, cleanCallees, normalizeAddress } from "./graph.ts";
 import { isShape, shapeOf } from "./similar.ts";
 import { loadDump, lookupFunction } from "./prepare.ts";
-import { DETAIL_KINDS, IDENTIFIER, cleanAlternatives, cleanDetails, type Detail } from "./rules.ts";
+import { DETAIL_KINDS, IDENTIFIER, checkText, cleanAlternatives, cleanDetails, type Detail } from "./rules.ts";
 import type { State } from "./types.ts";
 
 export interface AgentContext {
   targetPath: string;
+  provider?: AnalysisProvider;
   /** Command that takes a prompt on stdin and prints an answer on stdout, e.g. `claude -p ...`. */
   aiCommand: string;
   /** Which model you say you are using (informational; shown in notes). */
@@ -41,20 +43,20 @@ function parseInspected(stdout: string, address: string): { code: string; callee
 }
 
 /** From the local cache made by `pool prepare`, if this function is in it. No process is started. */
-function fromCache(targetPath: string, address: string): { code: string; callees: string[]; shape: string | null } | null {
-  const entry = lookupFunction(targetPath, address);
+function fromCache(targetPath: string, address: string, provider?: AnalysisProvider): { code: string; callees: string[]; shape: string | null } | null {
+  const entry = lookupFunction(targetPath, address, provider);
   if (!entry) return null;
   return { code: entry.code.replace(/\r/g, "").trim().slice(0, 6000), callees: cleanCallees(entry.callees, address), shape: shapeOf(entry.code) };
 }
 
 /** Fill callees (and fingerprints) of analysis tasks straight from the local dump. Changes `state`; returns how many tasks changed. */
 export function fillCalleesFromDump(state: State, targetPath: string): number {
-  const dump = loadDump(targetPath);
+  const dump = loadDump(targetPath, state.project.provider);
   if (!dump) return 0;
   let filled = 0;
   for (const task of state.tasks) {
     if ((task.kind ?? "analyze") !== "analyze") continue;
-    const entry = lookupFunction(targetPath, task.address);
+    const entry = lookupFunction(targetPath, task.address, state.project.provider);
     if (!entry) continue;
     let changed = false;
     if (task.callees === undefined) {
@@ -82,7 +84,7 @@ function isRealName(name: unknown): name is string {
 
 /** Mark untouched analysis tasks whose function already has a real name in the dump as done (known). Returns how many. */
 export function markKnownFromDump(state: State, targetPath: string, opts: { keepNamed?: boolean } = {}): number {
-  if (opts.keepNamed) return 0;
+  if (opts.keepNamed || state.project.provider) return 0;
   if (!loadDump(targetPath)) return 0;
   const touched = new Set<string>();
   for (const n of state.notes ?? []) touched.add(n.taskId);
@@ -103,10 +105,35 @@ export function markKnownFromDump(state: State, targetPath: string, opts: { keep
   return marked;
 }
 
+export function markCorvusNames(state: State, names: Map<string, string>): number {
+  const touched = new Set([...state.notes, ...state.proposals].map((n) => n.taskId));
+  const used = new Set(state.tasks.filter((t) => t.known).map((t) => t.known!.name.toLowerCase()));
+  for (const note of state.notes) if (note.status === "trusted" && note.kind === "function_name") used.add(note.value.toLowerCase());
+  let marked = 0;
+  for (const task of state.tasks) {
+    const name = names.get(normalizeAddress(task.address) ?? "");
+    if ((task.kind ?? "analyze") !== "analyze" || task.state !== "open" || task.known || touched.has(task.id) || task.doneBy?.length ||
+        !isRealName(name) || checkText(name, 64) || used.has(name.toLowerCase())) continue;
+    task.known = { name, source: "corvus" };
+    task.state = "done";
+    delete task.claimedBy;
+    delete task.claimSlot;
+    delete task.leaseUntil;
+    used.add(name.toLowerCase());
+    marked++;
+  }
+  return marked;
+}
+
+function managedInspection(result: { code: string; callees: string[] }): { code: string; callees: string[]; shape: string | null } {
+  return { ...result, code: result.code.replace(/\r/g, "").trim().slice(0, 6000), shape: shapeOf(result.code) };
+}
+
 /** One rea call returns both the pseudocode and the functions it calls. */
-export function inspectFunction(targetPath: string, address: string): { code: string; callees: string[]; shape: string | null } {
-  const cached = fromCache(targetPath, address);
+export function inspectFunction(targetPath: string, address: string, provider?: AnalysisProvider): { code: string; callees: string[]; shape: string | null } {
+  const cached = fromCache(targetPath, address, provider);
   if (cached) return cached;
+  if (provider === "corvus-dotnet") return managedInspection(inspectManagedSync(targetPath, address));
   const run = runCommand("rea", reaArgs(targetPath, address), { timeout: REA_TIMEOUT });
   if (run.error) throw new Error(`Could not start rea: ${run.error.message}`);
   if (run.status !== 0) throw new Error(`rea failed: ${(run.stderr ?? "").slice(0, 400)}`);
@@ -114,9 +141,10 @@ export function inspectFunction(targetPath: string, address: string): { code: st
 }
 
 /** Same as inspectFunction, but does not block the event loop. */
-export async function inspectFunctionAsync(targetPath: string, address: string): Promise<{ code: string; callees: string[]; shape: string | null }> {
-  const cached = fromCache(targetPath, address);
+export async function inspectFunctionAsync(targetPath: string, address: string, provider?: AnalysisProvider): Promise<{ code: string; callees: string[]; shape: string | null }> {
+  const cached = fromCache(targetPath, address, provider);
   if (cached) return cached;
+  if (provider === "corvus-dotnet") return managedInspection(await inspectManaged(new CorvusClient(targetPath), address));
   const run = await runCommandAsync("rea", reaArgs(targetPath, address), { timeout: REA_TIMEOUT });
   if (run.error) throw new Error(`Could not start rea: ${run.error.message}`);
   if (run.status !== 0) throw new Error(`rea failed: ${(run.stderr ?? "").slice(0, 400)}`);
@@ -267,7 +295,7 @@ Use "agree" only if the proposal is clearly correct. Use "disagree" if it descri
 
 function notesFromAnswer(ctx: AgentContext, answer: { name?: string; summary?: string; confidence?: string }, details: Detail[] = []): object[] {
   const confidence = ["low", "medium", "high"].includes(String(answer.confidence)) ? answer.confidence : "low";
-  const common = { confidence, model: ctx.model, agent: "rea-pool", evidence: ["decompiled by Ghidra via rea"] };
+  const common = { confidence, model: ctx.model, agent: "rea-pool", evidence: [ctx.provider === "corvus-dotnet" ? "decompiled by Corvus" : "decompiled by Ghidra via rea"] };
   const notes: object[] = [];
   if (answer.name) notes.push({ kind: "function_name", value: answer.name, ...common });
   if (answer.summary) notes.push({ kind: "comment", value: answer.summary, ...common });
@@ -302,23 +330,23 @@ function analysisFrom(ctx: AgentContext, answer: Answer, inspected: { callees: s
 }
 
 export function analyze(ctx: AgentContext, address: string, callees: Named = [], extras: Extras = {}, callers: Named = []): Analysis {
-  const inspected = inspectFunction(ctx.targetPath, address);
+  const inspected = inspectFunction(ctx.targetPath, address, ctx.provider);
   const answer = firstJson(askAi(ctx.aiCommand, analyzePrompt(inspected.code, callees, extras, callers, ctx.allowedKinds ?? DETAIL_KINDS))) as Answer;
   return analysisFrom(ctx, answer, inspected);
 }
 
 export async function analyzeAsync(ctx: AgentContext, address: string, callees: Named = [], extras: Extras = {}, callers: Named = []): Promise<Analysis> {
-  const inspected = await inspectFunctionAsync(ctx.targetPath, address);
+  const inspected = await inspectFunctionAsync(ctx.targetPath, address, ctx.provider);
   const answer = firstJson(await askAiAsync(ctx.aiCommand, analyzePrompt(inspected.code, callees, extras, callers, ctx.allowedKinds ?? DETAIL_KINDS))) as Answer;
   return analysisFrom(ctx, answer, inspected);
 }
 
 export function review(ctx: AgentContext, address: string, notes: { kind: string; value: string }[], callees: Named = [], callers: Named = []): "agree" | "disagree" | "unsure" {
-  const { code } = inspectFunction(ctx.targetPath, address);
+  const { code } = inspectFunction(ctx.targetPath, address, ctx.provider);
   return verdictFrom(firstJson(askAi(ctx.aiCommand, reviewPrompt(code, notes, callees, callers))));
 }
 
 export async function reviewAsync(ctx: AgentContext, address: string, notes: { kind: string; value: string }[], callees: Named = [], callers: Named = []): Promise<"agree" | "disagree" | "unsure"> {
-  const { code } = await inspectFunctionAsync(ctx.targetPath, address);
+  const { code } = await inspectFunctionAsync(ctx.targetPath, address, ctx.provider);
   return verdictFrom(firstJson(await askAiAsync(ctx.aiCommand, reviewPrompt(code, notes, callees, callers))));
 }
